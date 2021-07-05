@@ -12,7 +12,7 @@ struct Linear {
 
 impl Semigroup for Linear {
     /// k2 * (k1 * x + b1) + b2 = (k2 * k1) * x + (k2 * b1 + b2)
-    fn merge(self, other: &Self) -> Self {
+    fn merge(self, other: Self) -> Self {
         let p = unsafe { P } as u64;
         Self {
             k: ((self.k as u64 * other.k as u64) % p) as u32,
@@ -35,13 +35,13 @@ struct Sum(u32);
 struct Size(u32);
 
 impl Semigroup for Sum {
-    fn merge(self, other: &Self) -> Self {
+    fn merge(self, other: Self) -> Self {
         Self((self.0 + other.0) % unsafe { P })
     }
 }
 
 impl Semigroup for Size {
-    fn merge(self, other: &Self) -> Self {
+    fn merge(self, other: Self) -> Self {
         Self(self.0 + other.0)
     }
 }

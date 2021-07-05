@@ -6,12 +6,13 @@ use std::{
 
 /// `a.merge(&b.merge(&c)) == a.merge(&b).merge(&c)`
 pub trait Semigroup {
-    fn merge(self, other: &Self) -> Self;
+    fn merge(self, other: Self) -> Self;
 }
 
 impl<A: Semigroup, B: Semigroup> Semigroup for (A, B) {
-    fn merge(self, other: &Self) -> Self {
-        (A::merge(self.0, &other.0), B::merge(self.1, &other.1))
+    fn merge(self, (oa, ob): Self) -> Self {
+        let (a, b) = self;
+        (A::merge(a, oa), B::merge(b, ob))
     }
 }
 
@@ -29,8 +30,16 @@ impl<A: Monoid, B: Monoid> Monoid for (A, B) {
     }
 }
 
-pub trait Applier<V> {
+/// `m1.apply(a.merge(&b)) == m1.apply(a).merge(&m1.apply(b))`
+pub trait Applier<V: Semigroup> {
     fn apply(&self, to: V) -> V;
+}
+
+impl<A: Semigroup, B: Semigroup, MA: Applier<A>, MB: Applier<B>> Applier<(A, B)> for (MA, MB) {
+    fn apply(&self, (a, b): (A, B)) -> (A, B) {
+        let (ma, mb) = self;
+        (ma.apply(a), mb.apply(b))
+    }
 }
 
 #[derive(Debug)]
@@ -66,7 +75,7 @@ impl<V: Monoid + Clone, M> SegTree<V, M> {
     }
 }
 
-impl<V: Clone, M: Semigroup + Applier<V>> SegTree<V, M> {
+impl<V: Clone + Semigroup, M: Clone + Semigroup + Applier<V>> SegTree<V, M> {
     fn apply_all(&self, m: M) -> Self {
         match self {
             Self::Empty => Self::Empty,
@@ -80,7 +89,7 @@ impl<V: Clone, M: Semigroup + Applier<V>> SegTree<V, M> {
             } => Self::Branch {
                 size: *size,
                 value: m.apply(value.clone()),
-                modifier: m.merge(modifier),
+                modifier: M::merge(m, modifier.clone()),
                 left: left.clone(),
                 right: right.clone(),
             },
@@ -103,7 +112,7 @@ impl<V: Monoid + Clone, M: Monoid> SegTree<V, M> {
                 Self::Branch {
                     size: len,
                     modifier: M::empty(),
-                    value: l.all().merge(&r.all()),
+                    value: V::merge(l.all(), r.all()),
                     left: Rc::new(l),
                     right: Rc::new(r),
                 }
@@ -146,7 +155,7 @@ impl<V: Monoid + Clone, M: Applier<V> + Monoid + Clone> SegTree<V, M> {
                     } else {
                         V::merge(
                             left.query(range.start..mid),
-                            &right.query(0..range.end - mid),
+                            right.query(0..range.end - mid),
                         )
                     })
                 }
@@ -182,7 +191,7 @@ impl<V: Monoid + Clone, M: Applier<V> + Monoid + Clone> SegTree<V, M> {
                     Self::Branch {
                         size: *size,
                         value: m.apply(value.clone()),
-                        modifier: m.merge(modifier),
+                        modifier: M::merge(m, modifier.clone()),
                         left: left.clone(),
                         right: right.clone(),
                     }
@@ -211,7 +220,7 @@ impl<V: Monoid + Clone, M: Applier<V> + Monoid + Clone> SegTree<V, M> {
                     Self::Branch {
                         size: *size,
                         modifier: M::empty(),
-                        value: V::merge(new_left.all(), &new_right.all()),
+                        value: V::merge(new_left.all(), new_right.all()),
                         left: new_left,
                         right: new_right,
                     }
