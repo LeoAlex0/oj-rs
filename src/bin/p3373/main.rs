@@ -1,3 +1,4 @@
+use luogu::traits::*;
 use luogu::seg_tree::*;
 
 use std::io::{stdin, BufRead};

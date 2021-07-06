@@ -1,34 +1,10 @@
+use crate::traits::*;
+
 use std::{
     cmp::{max, min},
     ops::Range,
     rc::Rc,
 };
-
-/// `a.merge(&b.merge(&c)) == a.merge(&b).merge(&c)`
-pub trait Semigroup {
-    fn merge(self, other: Self) -> Self;
-}
-
-impl<A: Semigroup, B: Semigroup> Semigroup for (A, B) {
-    fn merge(self, (oa, ob): Self) -> Self {
-        let (a, b) = self;
-        (A::merge(a, oa), B::merge(b, ob))
-    }
-}
-
-/// `empty().merge(&a) == a.merge(&empty()) == a`
-pub trait Monoid
-where
-    Self: Semigroup,
-{
-    fn empty() -> Self;
-}
-
-impl<A: Monoid, B: Monoid> Monoid for (A, B) {
-    fn empty() -> Self {
-        (A::empty(), B::empty())
-    }
-}
 
 /// `m1.apply(a.merge(&b)) == m1.apply(a).merge(&m1.apply(b))`
 pub trait Applier<V: Semigroup> {
@@ -36,6 +12,7 @@ pub trait Applier<V: Semigroup> {
 }
 
 impl<A: Semigroup, B: Semigroup, MA: Applier<A>, MB: Applier<B>> Applier<(A, B)> for (MA, MB) {
+    #[inline]
     fn apply(&self, (a, b): (A, B)) -> (A, B) {
         let (ma, mb) = self;
         (ma.apply(a), mb.apply(b))
@@ -143,7 +120,7 @@ impl<V: Monoid + Clone, M: Applier<V> + Monoid + Clone> SegTree<V, M> {
                 left,
                 right,
             } => {
-                if range.start <= 0 && *size <= range.end {
+                if range.start == 0 && *size <= range.end {
                     value.clone()
                 } else {
                     let mid = size / 2;
@@ -187,7 +164,7 @@ impl<V: Monoid + Clone, M: Applier<V> + Monoid + Clone> SegTree<V, M> {
                 left,
                 right,
             } => {
-                if range.start <= 0 && *size <= range.end {
+                if range.start == 0 && *size <= range.end {
                     Self::Branch {
                         size: *size,
                         value: m.apply(value.clone()),

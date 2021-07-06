@@ -1,6 +1,3 @@
-pub mod seg_tree;
-
-pub mod group {
-    pub use super::seg_tree::Monoid;
-    pub use super::seg_tree::Semigroup;
-}
+pub mod data_structure;
+pub use data_structure::seg_tree;
+pub mod traits;
