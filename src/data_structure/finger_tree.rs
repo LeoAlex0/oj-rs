@@ -1,50 +1,32 @@
-use core::panic;
-use std::{ops::Add, rc::Rc};
+use std::{rc::Rc, sync::Arc};
 
 use crate::traits::{Monoid, Semigroup};
 
+// Traits
+
 pub trait Measured: Clone {
-    type To;
+    type To: Monoid + Clone;
     fn measure(&self) -> Self::To;
 }
+pub trait Ref<A>: Clone {
+    // Ref<A>::Reffed -> SomeRef<A>
+    type Reffed: AsRef<A> + Clone;
+}
 
+//-------------------
+// Struct & Enums
+//-------------------
 #[derive(Clone)]
-enum NodeInner<A: Measured> {
-    Leaf(A),
-    Node2 {
-        measure: A::To,
-        left: Node<A>,
-        right: Node<A>,
-    },
-    Node3 {
-        measure: A::To,
-        left: Node<A>,
-        middle: Node<A>,
-        right: Node<A>,
-    },
+pub struct RcRef;
+#[derive(Clone)]
+pub struct ArcRef;
+#[derive(Clone)]
+pub struct NormalRef;
+impl<A> Ref<A> for RcRef {
+    type Reffed = Rc<A>;
 }
-type Node<A> = Rc<NodeInner<A>>;
-impl<A: Measured> Measured for NodeInner<A>
-where
-    A::To: Semigroup + Clone,
-{
-    type To = A::To;
-
-    fn measure(&self) -> Self::To {
-        match self {
-            NodeInner::Leaf(v) => v.measure(),
-            NodeInner::Node2 { measure, .. } => measure.clone(),
-            NodeInner::Node3 { measure, .. } => measure.clone(),
-        }
-    }
-}
-impl<A: Measured> NodeInner<A>
-where
-    A::To: Monoid,
-{
-    fn splitAt<F: Clone + Fn(A::To) -> bool>() -> (Option<NodeInner<A>>, A, Option<NodeInner<A>>) {
-        todo!()
-    }
+impl<A> Ref<A> for ArcRef {
+    type Reffed = Arc<A>;
 }
 
 #[derive(Clone)]
@@ -54,98 +36,104 @@ enum Digit<A> {
     Three([A; 3]),
     Four([A; 4]),
 }
-impl<A> AsRef<[A]> for Digit<A> {
-    fn as_ref(&self) -> &[A] {
-        match self {
-            Self::One(v) => v,
-            Self::Two(v) => v,
-            Self::Three(v) => v,
-            Self::Four(v) => v,
-        }
-    }
-}
-impl<'a, A, R> Add<R> for &'a Digit<A>
-where
-    A: Clone,
-    R: AsRef<[A]>,
-{
-    type Output = Digit<A>;
 
-    fn add(self, rhs: R) -> Self::Output {
-        match (self.as_ref(), rhs.as_ref()) {
-            ([a], []) => Digit::One([a.clone()]),
-            ([a], [b]) | ([a, b], []) => Digit::Two([a.clone(), b.clone()]),
-            ([a], [b, c]) | ([a, b], [c]) | ([a, b, c], []) => {
-                Digit::Three([a.clone(), b.clone(), c.clone()])
-            }
-            ([a], [b, c, d]) | ([a, b], [c, d]) | ([a, b, c], [d]) | ([a, b, c, d], []) => {
-                Digit::Four([a.clone(), b.clone(), c.clone(), d.clone()])
-            }
-            (x, y) => panic!(
-                "Too long, Digit only support max 4 element but actually {} + {} element",
-                x.len(),
-                y.len()
-            ),
-        }
-    }
-}
-impl<'a, A> From<&'a [A]> for Digit<A>
+#[derive(Clone)]
+enum Node<R, A>
 where
-    A: Clone,
+    R: Ref<A> + Ref<Node<R, A>>,
+    A: Measured,
 {
-    fn from(slice: &'a [A]) -> Digit<A> {
-        match slice {
-            [v0] => Digit::One([v0.clone()]),
-            [v0, v1] => Digit::Two([v0.clone(), v1.clone()]),
-            [v0, v1, v2] => Digit::Three([v0.clone(), v1.clone(), v2.clone()]),
-            [v0, v1, v2, v3] => Digit::Four([v0.clone(), v1.clone(), v2.clone(), v3.clone()]),
-            _ => panic!("immposible to create digit from of size: {}", slice.len()),
-        }
-    }
+    Leaf(<R as Ref<A>>::Reffed),
+    Node2 {
+        measure: A::To,
+        left: <R as Ref<Node<R, A>>>::Reffed,
+        right: <R as Ref<Node<R, A>>>::Reffed,
+    },
+    Node3 {
+        measure: A::To,
+        left: <R as Ref<Node<R, A>>>::Reffed,
+        middle: <R as Ref<Node<R, A>>>::Reffed,
+        right: <R as Ref<Node<R, A>>>::Reffed,
+    },
 }
-impl<A: Measured> Measured for Digit<A>
+
+#[derive(Clone)]
+enum FingerTree<R, A>
 where
-    A::To: Semigroup,
+    R: Ref<A> + Ref<Node<R, A>> + Ref<FingerTree<R, A>>,
+    A: Measured,
+{
+    Empty,
+    Unit(<R as Ref<A>>::Reffed),
+    Deep {
+        measure: A::To,
+        prefix: Digit<<R as Ref<Node<R, A>>>::Reffed>,
+        deeper: <R as Ref<FingerTree<R, A>>>::Reffed,
+        suffix: Digit<<R as Ref<Node<R, A>>>::Reffed>,
+    },
+}
+
+//-------------------------
+// Impl
+//-------------------------
+
+impl<A> Measured for Digit<A>
+where
+    A: Measured,
 {
     type To = A::To;
     fn measure(&self) -> Self::To {
         match self {
-            Digit::One([a]) => a.measure(),
-            Digit::Two([a, b]) => A::To::merge(a.measure(), b.measure()),
-            Digit::Three([a, b, c]) => a.measure().merge(b.measure()).merge(c.measure()),
-            Digit::Four([a, b, c, d]) => A::To::merge(
-                a.measure().merge(b.measure()),
-                c.measure().merge(d.measure()),
+            Self::One([a]) => a.measure(),
+            Self::Two([a, b]) => A::To::merge(a.measure(), b.measure()),
+            Self::Three([a, b, c]) => a.measure().merge(b.measure()).merge(c.measure()),
+            Self::Four([a, b, c, d]) => A::To::merge(
+                A::To::merge(a.measure(), b.measure()),
+                A::To::merge(c.measure(), d.measure()),
             ),
         }
     }
 }
 
-#[derive(Clone)]
-enum FingerTreeImpl<A: Measured> {
-    Empty,
-    Unit(A),
-    Deep {
-        measure: A::To,
-        pr: Digit<Node<A>>,
-        m: FingerTree<A>,
-        sf: Digit<Node<A>>,
-    },
-}
-#[derive(Clone)]
-pub struct FingerTree<A: Measured>(Rc<FingerTreeImpl<A>>);
-
-impl<A: Measured> Measured for FingerTreeImpl<A>
+impl<R, A> Measured for Node<R, A>
 where
-    A::To: Clone + Monoid,
+    R: Ref<A> + Ref<Node<R, A>>,
+    A: Measured,
+{
+    type To = A::To;
+
+    fn measure(&self) -> Self::To {
+        match self {
+            Self::Leaf(refd) => refd.as_ref().measure(),
+            Node::Node2 { measure, .. } => measure.clone(),
+            Node::Node3 { measure, .. } => measure.clone(),
+        }
+    }
+}
+
+impl<R, A> Measured for FingerTree<R, A>
+where
+    R: Ref<A> + Ref<Node<R, A>> + Ref<FingerTree<R, A>>,
+    A: Measured,
 {
     type To = A::To;
 
     fn measure(&self) -> Self::To {
         match self {
             Self::Empty => A::To::empty(),
-            Self::Unit(a) => a.measure(),
+            Self::Unit(v) => v.as_ref().measure(),
             Self::Deep { measure, .. } => measure.clone(),
+        }
+    }
+}
+
+impl<A> AsRef<[A]> for Digit<A> {
+    fn as_ref(&self) -> &[A] {
+        match self {
+            Self::One(a) => a,
+            Self::Two(a) => a,
+            Self::Three(a) => a,
+            Self::Four(a) => a,
         }
     }
 }
