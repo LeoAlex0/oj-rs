@@ -31,7 +31,7 @@ impl<T: Semigroup> Monoid for Option<T> {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Size(pub usize);
 impl Semigroup for Size {
     #[inline]
