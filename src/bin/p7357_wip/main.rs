@@ -1,1 +1,5 @@
+
+struct SplitTree {
+}
+
 fn main() {}
