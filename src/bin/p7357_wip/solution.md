@@ -3,6 +3,7 @@
 给定一棵以$1$为根的包含 $n \in [1,10^5]$ 个节点的有根树。第$i$个节点有点权$a_i \in [1,10^5]$。
 
 需要依次处理$q \in [1,10^5]$次操作：
+
 1. `1 u`：对点`u`的点权$a_u$取亦或$1$，即：$a_u'=a_u \oplus 1$
 2. `1 u v`: 求出包含点$u$,$v$的所有路径中，对应点权的中位数最大的那一条路径的点权的*中位数*。
 
@@ -34,6 +35,7 @@ $$
 其中$Card(x)$指集合$x$中元素的个数。
 
 注意到对于操作2,点$u$和点$v$不在同一枝上，故对于目标路径$u' \to v'$，对称地，我们不妨设：
+
 * $u' \in sub(u)$
 * $v' \in sub(v)$
 
@@ -47,7 +49,7 @@ ans &= \max_{u'\in sub(u),v'\in sub(v)} \left\{
     \argmax_{x} \left\{
         \sum_{i\in [u',v']} cmp(a_i,x) \le 0
         \right\}
-    \right\} \\ 
+    \right\} \\
     &= \max_{u'\in sub(u),v'\in sub(v)} \left\{
     \argmax_{x} \left\{
         \sum_{i\in [u',u)} cmp(a_i,x) +
@@ -60,12 +62,16 @@ ans &= \max_{u'\in sub(u),v'\in sub(v)} \left\{
 $$
 
 其中：
+
 * $[a,b]$为点$a$到$b$的路径上所有点构成的集合（包含点$a,b$）
 * $(a,b)$为点$a$到$b$的路径中所有点构成的集合（不含点$a,b$）
 * $[a,b)$与$(a,b]$同理
 
-注意到对于$x$而言，$Card(\{ a_i < x\}) - Card(\{ x \le a_i \})=\sum_i cmp(a_i,x)$
-是单调递增的，而$\sum_{i\in (u,v)} cmp(a_i,x)$又是一常数（对于固定$x$）。
+注意到对于$x$而言:
+
+* $Card(\{ a_i < x\}) - Card(\{ x \le a_i \})=\sum_i cmp(a_i,x)$
+对于$x$是单调递增的
+* $\sum_{i\in (u,v)} cmp(a_i,x)$又是一常数（对于固定$x$）。
 
 故若要最大化中位数，需要最小化剩余两项，即：
 
@@ -80,8 +86,8 @@ ans &= \max_{u'\in sub(u),v'\in sub(v)} \left\{
         \right\}
     \right\} \\
     &= \argmax_{x} \left\{
-        \min_{u'\in sub(u)} \left\{ 
-            \sum_{i\in [u',u)} cmp(a_i,x) 
+        \min_{u'\in sub(u)} \left\{
+            \sum_{i\in [u',u)} cmp(a_i,x)
         \right\} +
         \sum_{i\in [u,v]} cmp(a_i,x) +
         \min_{v'\in sub(v)} \left\{
@@ -95,9 +101,9 @@ $$
 所以我们需要一个结构用以维护：
 
 $$
-f(x,v) = \min_{v'\in sub(v)} \left\{ 
+f(x,v) = \min_{v'\in sub(v)} \left\{
             \sum_{i\in [v',v)} cmp(a_i,x),0
-        \right\} 
+        \right\}
 $$
 
 进而此时每次查询的答案为：
@@ -105,8 +111,8 @@ $$
 $$
 \begin{aligned}
 ans &= \argmax_{x} \left\{
-        \min_{u'\in sub(u)} \left\{ 
-            \sum_{i\in [u',u)} cmp(a_i,x) 
+        \min_{u'\in sub(u)} \left\{
+            \sum_{i\in [u',u)} cmp(a_i,x)
         \right\} +
         \sum_{i\in (u,v)} cmp(a_i,x) +
         \min_{v'\in sub(v)} \left\{
@@ -124,6 +130,7 @@ ans &= \argmax_{x} \left\{
 $$
 
 考虑到在题设与$f(x,a)$的表达式中:
+
 1. 所有的修改只会导致$a_v = a_v \pm 1$，故只有$x=a_v,a_v\pm 1$两点需要修改，这是好的。
 2. 对于所有$i\in sub(a)$，其对应的所有DFS遍历的*序号*是连续的，这是更好的。
    * *序号*指第几个被DFS遍历的
@@ -135,16 +142,16 @@ $$
 > 一个直接的想法是将$f(x,v)$转化为在题设给的树上的递推式：
 > $$
 > \begin{aligned}
->    f(x,v) &= \min_{v'\in sub(v)} \left\{ 
->        \sum_{i\in [v',v)} cmp(a_i,x),0
->    \right\} \\
->           &= \min_{v'\in child(v)} \left\{
->       f(x,v')+cmp(a_{v'},x),0
->    \right\}
+> f(x,v) &= \min_{v'\in sub(v)} \left\{
+> \sum_{i\in [v',v)} cmp(a_i,x),0
+> \right\} \\
+> &= \min_{v'\in child(v)} \left\{
+> f(x,v')+cmp(a_{v'},x),0
+> \right\}
 > \end{aligned}
 > $$
 > 其中： $child(v)$指点$v$所有子结点所在的集合
-> 
+>
 > 若如此维护，在更新时至少会替换一整条链。若题设给出的树退化成链，则最坏情况下需要反复重建，
 > 复杂度无法接受。
 
@@ -155,9 +162,9 @@ $$
 
 $$
 \begin{aligned}
-p(x,v) &=  \sum_{i\in [1,ord^{-1}(v)]} cmp(a_i,x) \\
+p(x,v) &\equiv  \sum_{i\in [1,ord^{-1}(v)]} cmp(a_i,x) \\
 min_p (x,[L,R]) &= \min_{i\in [L,R]} \{ p(x,i) \} \\
-f(x,v) &= \min_{v'\in sub(v)} \left\{ 
+f(x,v) &= \min_{v'\in sub(v)} \left\{
         \sum_{i\in [v',v)} cmp(a_i,x),0
     \right\} \\
     &= \min_{v'\in sub(v)} \left\{
@@ -175,6 +182,7 @@ f(x,v) &= \min_{v'\in sub(v)} \left\{
 $$
 
 其中:
+
 * $L_m(v)$指DFS序编号为$v$的节点所在子树上最小的DFS序编号
 * $R_m(v)$指DFS序编号为$v$的节点所在子树上最大的DFS序编号
 * $ord(v)$指节点$v$的DFS序编号
@@ -190,7 +198,7 @@ $$
 p(x,v) &= \sum_{i\in [1,ord^{-1}(v)]} cmp(a_i,x) \\
 &= \begin{cases}
     -1 &  x = 0 \wedge \underbrace{ord^{-1}(v)= 1}_{根节点}  \\
-    p(0,\underbrace{ord(parent(ord^{-1}))}_{父节点})-1 & x = 0 \wedge ord^{-1}(v)\ne 1 \\
+    p(0,\underbrace{ord(parent(ord^{-1}(v)))}_{父节点})-1 & x = 0 \wedge ord^{-1}(v)\ne 1 \\
     p(x-1,v) + 2 \times \underbrace{count(\overbrace{[1,ord^{-1}(v)]}^{到v的路径},x-1)}_{到v的路径上点权为x-1的节点个数} & otherwise
 \end{cases}
 \end{aligned}
@@ -201,17 +209,19 @@ $$
 > 具体的方法是: 对于$p(x-1,*)$中的所有满足$a_{ord^{-1}(v)}=x-1$的$v$，将$i\in [L_m(v),R_m(v)]$处的$p(x-1,i)+=2$，最终得到的结构即可用于维护$p(x,*)$
 
 至此，我们可以给维护$p(x,*)$的结构所要求的操作做个总结：
+
 * $p(x,*)$区间修改：$(+2)$ （考虑到修改应该是$(+k)$）
 * $p(x,*)$区间查询：$\min$
 * $p(x,*)$单点查询（当然也可以理解为单点的$\min$）
 
 可以发现，$(\mathbb{R},\min)$构成一个幺半群，而$+k$与函数复合$.$构成可交换幺半群，并且是$\mathbb{R}$上的一个*算子幺半群(Operator Monoid)*，且在$\min$上有分配律，故可以考虑线段树实现。
 > 即满足以下性质：
+>
 > * $\min$的结合律：$\forall a,b,c: \min(a,\min(b,c)) = \min(\min(a,b),c)$ (显然)
 > * $\min$的单位元：$\exist e: \forall a: \min(e,a) = \min(a,e) = a$
 >   * 对本题设，任取$e>10^5$，均满足条件
 >   * 当然不失一般地，也可以通过拓展一个$+\infty$以满足条件
-> * $(+k)$对$\min$分配律：$\forall a,b,k: (+k)(\min(a,b)) = \min((+k)(a),(+k)(b))$ 
+> * $(+k)$对$\min$分配律：$\forall a,b,k: (+k)(\min(a,b)) = \min((+k)(a),(+k)(b))$
 >   * 其中：定义函数$(+k)$为$(+k)(m) = m+k$
 >   * 故，$左=\min(a,b)+k=\min(a+k,b+k)=右$，得证
 > * $(+k)$在$\mathbb{R}$上的算子：$\forall k_1,k_2,a:((+k_1).(+k_2))(a) = (+k_1)((+k_2)(a))$
@@ -222,7 +232,7 @@ $$
 > * $(+k)$的单位元：$\exists e:\forall k:(+k).(+e)=(+e).(+k)=(+k)$
 >   * 取$e=0$即可
 > * $(+k)$的交换律: $\forall k_1,k_2: (+k_1).(+k_2) = (+k_2).(+k_1)$
-> 
+>
 
 在考虑完上述问题之后，再看我们所需要的查询结果$ans$，我们可以看到：
 $$
@@ -243,17 +253,17 @@ ans &= \argmax_{x} \left\{
         min_p(x,[L_m(ord(u)),R_m(ord(u))]) - p(x,ord(u)) +
         p(x,ord(u)) - p(x,ord(lca(u,v))) +
         p(x,ord(v)) - p(x,ord(lca(u,v))) +
-        cmp(a_{lca(u,v)},x) + 
+        cmp(a_{lca(u,v)},x) +
         min_p(x,[L_m(ord(v)),R_m(ord(v))]) - p(x,ord(v))
         \le 0
     \right\} \\
     &= \argmax_{x} \left\{
-        min_p(x,[L_m(ord(u)),R_m(ord(u))]) + 
+        min_p(x,[L_m(ord(u)),R_m(ord(u))]) +
         min_p(x,[L_m(ord(v)),R_m(ord(v))])
         - 2p(x,ord(lca(u,v))) +
-        cmp(a_{lca(u,v)},x) 
+        cmp(a_{lca(u,v)},x)
         \le 0
-    \right\} 
+    \right\}
 \end{aligned}
 $$
 
@@ -263,12 +273,14 @@ $$
 > 一个可能的替代是离线化后使用`tarjan`算法一次性扫出所有需要的$lca$。
 >
 > 但是：
+>
 > 1. 我不喜欢离线化，因为离线化会限制算法的实际使用场景
 > 2. 既然要离线化，为何不干脆考虑些更为激进的写法？
 
 考虑到单调性，我们可以直接在此基础上二分查找$ans$。
 
 故静态地，复杂度为：
+
 * 预处理时间：最坏$O(\max(m,n)\lg n)$
 * 预处理空间：最坏$O(\max(m,n)+m\lg n)$
 * 每次查询：最坏$O(\lg m\lg n)$
