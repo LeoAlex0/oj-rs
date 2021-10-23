@@ -7,7 +7,7 @@ pub trait Measured: Clone {
     fn measure(&self) -> Self::To;
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Value<T>(T);
 impl<T: Clone> Measured for Value<T> {
     type To = Size;
@@ -49,7 +49,7 @@ impl<A> Ref<A> for std::sync::Arc<A> {
 }
 
 pub trait PersistMonoidIndexDeque<A: Measured>: Measured {
-    fn split<F: Fn(A::To) -> bool>(&self, pred: F) -> Option<(Self, A, Self)>;
+    fn split<F: Fn(&A::To) -> bool>(&self, pred: F) -> Option<(Self, A, Self)>;
     fn concat(&self, other: &Self) -> Self;
     fn push_l(a: A, deq: &Self) -> Self;
     fn push_r(deq: &Self, a: A) -> Self;
@@ -104,15 +104,15 @@ struct LiftNodeIter<R: TreeRef<A>, A: Measured, I: Iterator<Item = NodeInner<A, 
 
 #[test]
 fn build_fingertree() {
-    let x = FingerTreeInner::push_l(NodeInner::leaf(Value(1)), FingerTreeInner::empty());
-    assert_eq!(x.measure(), Size(1));
-    let x: FingerTreeInner<_, RcRef> = FingerTreeInner::push_l(NodeInner::leaf(Value(2)), x);
-    assert_eq!(x.measure(), Size(2));
-
-    match x.view_l() {
-        Some((NodeInner::Leaf(Value(2)), FingerTreeInner::Unit(NodeInner::Leaf(Value(1))))) => {}
-        _ => panic!("view_left error"),
-    }
+    let tree: FingerTree<_> = (1..20).map(Value).collect();
+    assert_eq!(tree.view_l().map(|it| it.0), Some(Value(1)));
+    assert_eq!(tree.view_r().map(|it| it.1), Some(Value(19)));
+    assert_eq!(tree.split(|x| x > &Size(6)).map(|it| it.1), Some(Value(5)));
+    let new_tree = tree.concat(&(1..20).map(Value).collect());
+    assert_eq!(
+        new_tree.split(|x| x > &Size(19)).map(|it| it.1),
+        Some(Value(1))
+    );
 }
 
 #[derive(Clone)]
@@ -133,6 +133,55 @@ where
 
 #[derive(Clone)]
 pub struct FingerTree<A: Measured, R: TreeRef<A> = RcRef>(FingerTreeInner<A, R>);
+
+impl<A: Measured, R: TreeRef<A>> std::iter::FromIterator<A> for FingerTree<A, R> {
+    fn from_iter<T: IntoIterator<Item = A>>(iter: T) -> Self {
+        FingerTree(FingerTreeInner::push_many_r(
+            FingerTreeInner::empty(),
+            iter.into_iter().map(NodeInner::leaf),
+        ))
+    }
+}
+
+impl<A: Measured, R: TreeRef<A>> PersistMonoidIndexDeque<A> for FingerTree<A, R> {
+    fn split<F: Fn(&A::To) -> bool>(&self, pred: F) -> Option<(Self, A, Self)> {
+        match self.0.clone().split_offset(A::To::empty(), &pred) {
+            None => None,
+            Some((front, NodeInner::Leaf(a), back)) => {
+                Some((FingerTree(front), a, FingerTree(back)))
+            }
+            _ => panic!("not the shallowest tree layer"),
+        }
+    }
+
+    fn concat(&self, other: &Self) -> Self {
+        FingerTree(FingerTreeInner::concat(self.0.clone(), other.0.clone()))
+    }
+
+    fn push_l(a: A, deq: &Self) -> Self {
+        FingerTree(FingerTreeInner::push_l(NodeInner::Leaf(a), deq.0.clone()))
+    }
+
+    fn push_r(deq: &Self, a: A) -> Self {
+        FingerTree(FingerTreeInner::push_r(deq.0.clone(), NodeInner::Leaf(a)))
+    }
+
+    fn view_l(&self) -> Option<(A, Self)> {
+        match self.0.clone().view_l() {
+            None => None,
+            Some((NodeInner::Leaf(a), tree)) => Some((a, FingerTree(tree))),
+            _ => panic!("not the shallowest tree layer"),
+        }
+    }
+
+    fn view_r(&self) -> Option<(Self, A)> {
+        match self.0.clone().view_r() {
+            None => None,
+            Some((tree, NodeInner::Leaf(a))) => Some((FingerTree(tree), a)),
+            _ => panic!("not the shallowest tree layer"),
+        }
+    }
+}
 
 impl<A: Measured, R: TreeRef<A>> Measured for FingerTree<A, R> {
     type To = A::To;
@@ -276,12 +325,6 @@ impl<A> Digit<A> {
             _ => panic!("cannot push element to a 4 element digit"),
         }
     }
-    fn option_push_right(digit: Option<Self>, a: A) -> Self {
-        match digit {
-            None => Digit::One([a]),
-            Some(digit) => Self::push_right(digit, a),
-        }
-    }
 
     fn view_left(self) -> (A, Option<Self>) {
         match self {
@@ -315,9 +358,6 @@ impl<A: Measured> Digit<A> {
             let (ofront, a, otail) = tail.unwrap().split_offset(cur_measure, pred);
             (Some(Digit::option_push_left(cur, ofront)), a, otail)
         }
-    }
-    fn split<F: Fn(&A::To) -> bool>(self, pred: &F) -> (Option<Digit<A>>, A, Option<Digit<A>>) {
-        self.split_offset(A::To::empty(), pred)
     }
 }
 
@@ -511,7 +551,7 @@ where
     fn push_many_l<I: Iterator<Item = NodeInner<A, R>>>(mut iter: I, tree: Self) -> Self {
         match iter.next() {
             None => tree,
-            Some(a) => Self::push_l(a, tree),
+            Some(a) => Self::push_many_l(iter, Self::push_l(a, tree)),
         }
     }
 
@@ -548,7 +588,7 @@ where
     fn push_many_r<I: Iterator<Item = NodeInner<A, R>>>(tree: Self, mut iter: I) -> Self {
         match iter.next() {
             None => tree,
-            Some(a) => Self::push_r(tree, a),
+            Some(a) => Self::push_many_r(Self::push_r(tree, a), iter),
         }
     }
 
