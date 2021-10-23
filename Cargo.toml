@@ -6,4 +6,12 @@ edition = "2018"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[profile.bench]
+opt-level = 2
+codegen-units = 1
+
+[profile.test]
+opt-level = 2
+codegen-units = 1
+
 [dependencies]

@@ -8,7 +8,7 @@ pub trait Measured: Clone {
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Value<T>(T);
+pub struct Value<T>(pub T);
 impl<T: Clone> Measured for Value<T> {
     type To = Size;
 
@@ -102,25 +102,6 @@ struct LiftNodeIter<R: TreeRef<A>, A: Measured, I: Iterator<Item = NodeInner<A, 
     iter: I,
 }
 
-#[test]
-fn build_fingertree() {
-    let tree: FingerTree<_> = (0..20).map(Value).collect();
-    assert_eq!(tree.view_l().map(|it| it.0), Some(Value(0)));
-    assert_eq!(tree.view_r().map(|it| it.1), Some(Value(19)));
-
-    for i in 0..20 {
-        let at = tree.split(|x| x > &Size(i)).map(|it| it.1);
-        assert_eq!(at, Some(Value(i)))
-    }
-
-    let tree = tree.concat(&tree);
-    assert_eq!(tree.measure(), Size(40));
-    for i in 20..40 {
-        let at = tree.split(|x| x > &Size(i)).map(|it| it.1);
-        assert_eq!(at, Some(Value(i - 20)))
-    }
-}
-
 #[derive(Clone)]
 enum FingerTreeInner<A, R = RcRef>
 where
@@ -141,6 +122,7 @@ where
 pub struct FingerTree<A: Measured, R: TreeRef<A> = RcRef>(FingerTreeInner<A, R>);
 
 impl<A: Measured, R: TreeRef<A>> std::iter::FromIterator<A> for FingerTree<A, R> {
+    #[inline]
     fn from_iter<T: IntoIterator<Item = A>>(iter: T) -> Self {
         FingerTree(FingerTreeInner::push_many_r(
             FingerTreeInner::empty(),
@@ -485,7 +467,7 @@ where
                 let right = self.next_subtree();
                 Some(NodeInner::node2(left, right))
             }
-            5 => {
+            3 | 5 => {
                 let left = self.next_subtree();
                 let middle = self.next_subtree();
                 let right = self.next_subtree();
@@ -596,11 +578,11 @@ where
         }
     }
 
-    fn push_many_r(tree: Self, iter: &mut dyn Iterator<Item = NodeInner<A, R>>) -> Self {
-        match iter.next() {
-            None => tree,
-            Some(a) => Self::push_many_r(Self::push_r(tree, a), iter),
+    fn push_many_r(mut tree: Self, iter: &mut dyn Iterator<Item = NodeInner<A, R>>) -> Self {
+        for a in iter {
+            tree = Self::push_r(tree, a);
         }
+        tree
     }
 
     fn deep_l(
