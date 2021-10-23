@@ -49,6 +49,7 @@ impl<A> Ref<A> for std::sync::Arc<A> {
 }
 
 pub trait PersistMonoidIndexDeque<A: Measured>: Measured {
+    fn new() -> Self;
     fn split<F: Fn(&A::To) -> bool>(&self, pred: F) -> Option<(Self, A, Self)>;
     fn concat(&self, other: &Self) -> Self;
     fn push_l(a: A, deq: &Self) -> Self;
@@ -132,6 +133,10 @@ impl<A: Measured, R: TreeRef<A>> std::iter::FromIterator<A> for FingerTree<A, R>
 }
 
 impl<A: Measured, R: TreeRef<A>> PersistMonoidIndexDeque<A> for FingerTree<A, R> {
+    fn new() -> Self {
+        FingerTree(FingerTreeInner::empty())
+    }
+
     fn split<F: Fn(&A::To) -> bool>(&self, pred: F) -> Option<(Self, A, Self)> {
         match self.0.clone().split_offset(A::To::empty(), &pred) {
             None => None,
