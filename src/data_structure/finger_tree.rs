@@ -97,22 +97,28 @@ where
 }
 struct LiftNodeIter<R: TreeRef<A>, A: Measured, I: Iterator<Item = NodeInner<A, R>>> {
     buff: [Option<NodeInner<A, R>>; 5],
-    left: usize,
-    index: usize,
+    left: u8,
+    index: u8,
     iter: I,
 }
 
 #[test]
 fn build_fingertree() {
-    let tree: FingerTree<_> = (1..20).map(Value).collect();
-    assert_eq!(tree.view_l().map(|it| it.0), Some(Value(1)));
+    let tree: FingerTree<_> = (0..20).map(Value).collect();
+    assert_eq!(tree.view_l().map(|it| it.0), Some(Value(0)));
     assert_eq!(tree.view_r().map(|it| it.1), Some(Value(19)));
-    assert_eq!(tree.split(|x| x > &Size(6)).map(|it| it.1), Some(Value(5)));
-    let new_tree = tree.concat(&(1..20).map(Value).collect());
-    assert_eq!(
-        new_tree.split(|x| x > &Size(19)).map(|it| it.1),
-        Some(Value(1))
-    );
+
+    for i in 0..20 {
+        let at = tree.split(|x| x > &Size(i)).map(|it| it.1);
+        assert_eq!(at, Some(Value(i)))
+    }
+
+    let tree = tree.concat(&tree);
+    assert_eq!(tree.measure(), Size(40));
+    for i in 20..40 {
+        let at = tree.split(|x| x > &Size(i)).map(|it| it.1);
+        assert_eq!(at, Some(Value(i - 20)))
+    }
 }
 
 #[derive(Clone)]
@@ -138,7 +144,7 @@ impl<A: Measured, R: TreeRef<A>> std::iter::FromIterator<A> for FingerTree<A, R>
     fn from_iter<T: IntoIterator<Item = A>>(iter: T) -> Self {
         FingerTree(FingerTreeInner::push_many_r(
             FingerTreeInner::empty(),
-            iter.into_iter().map(NodeInner::leaf),
+            &mut iter.into_iter().map(NodeInner::leaf),
         ))
     }
 }
@@ -411,8 +417,8 @@ impl<A: Measured, R: TreeRef<A>> NodeInner<A, R> {
         }
     }
 
-    fn lift<I: Iterator<Item = Self>>(iter: I) -> LiftNodeIter<R, A, I> {
-        LiftNodeIter::new(iter)
+    fn lift<I: IntoIterator<Item = Self>>(iter: I) -> LiftNodeIter<R, A, I::IntoIter> {
+        LiftNodeIter::new(iter.into_iter())
     }
 
     fn unlift_digit(self) -> Digit<Self> {
@@ -447,7 +453,7 @@ where
         Self {
             buff,
             iter,
-            left,
+            left: left as u8,
             index: 0,
         }
     }
@@ -457,7 +463,7 @@ where
         if new.is_none() {
             self.left -= 1
         }
-        let ret = core::mem::replace(&mut self.buff[self.index], new).unwrap();
+        let ret = core::mem::replace(&mut self.buff[self.index as usize], new).unwrap();
         self.index = (self.index + 1) % 5;
         ret
     }
@@ -474,12 +480,17 @@ where
     fn next(&mut self) -> Option<Self::Item> {
         match self.left {
             0 => None,
-            2 | 4 => Some(NodeInner::node2(self.next_subtree(), self.next_subtree())),
-            5 => Some(NodeInner::node3(
-                self.next_subtree(),
-                self.next_subtree(),
-                self.next_subtree(),
-            )),
+            2 | 4 => {
+                let left = self.next_subtree();
+                let right = self.next_subtree();
+                Some(NodeInner::node2(left, right))
+            }
+            5 => {
+                let left = self.next_subtree();
+                let middle = self.next_subtree();
+                let right = self.next_subtree();
+                Some(NodeInner::node3(left, middle, right))
+            }
             _ => panic!("cannot lift node with only 1 subtree"),
         }
     }
@@ -548,10 +559,10 @@ where
         }
     }
 
-    fn push_many_l<I: Iterator<Item = NodeInner<A, R>>>(mut iter: I, tree: Self) -> Self {
+    fn push_many_l(iter: &mut dyn Iterator<Item = NodeInner<A, R>>, tree: Self) -> Self {
         match iter.next() {
             None => tree,
-            Some(a) => Self::push_many_l(iter, Self::push_l(a, tree)),
+            Some(a) => Self::push_l(a, Self::push_many_l(iter, tree)),
         }
     }
 
@@ -585,7 +596,7 @@ where
         }
     }
 
-    fn push_many_r<I: Iterator<Item = NodeInner<A, R>>>(tree: Self, mut iter: I) -> Self {
+    fn push_many_r(tree: Self, iter: &mut dyn Iterator<Item = NodeInner<A, R>>) -> Self {
         match iter.next() {
             None => tree,
             Some(a) => Self::push_many_r(Self::push_r(tree, a), iter),
@@ -710,10 +721,14 @@ where
     }
 
     fn concat(front: Self, back: Self) -> Self {
-        Self::concat_3_way(front, std::iter::empty(), back)
+        Self::concat_3_way(front, &mut std::iter::empty(), back)
     }
 
-    fn concat_3_way<I: Iterator<Item = NodeInner<A, R>>>(front: Self, mid: I, back: Self) -> Self {
+    fn concat_3_way(
+        front: Self,
+        mid: &mut dyn Iterator<Item = NodeInner<A, R>>,
+        back: Self,
+    ) -> Self {
         match (front, back) {
             (Self::Empty, back) => Self::push_many_l(mid, back),
             (front, Self::Empty) => Self::push_many_r(front, mid),
@@ -736,7 +751,7 @@ where
                 pr1,
                 R::TreeRef::new(FingerTree(Self::concat_3_way(
                     m1.0.clone(),
-                    NodeInner::lift(sf1.into_iter().chain(mid).chain(pr2.into_iter())),
+                    &mut NodeInner::lift(sf1.into_iter().chain(mid).chain(pr2)),
                     m2.0.clone(),
                 ))),
                 sf2,
