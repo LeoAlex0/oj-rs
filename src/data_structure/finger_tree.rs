@@ -22,8 +22,8 @@ pub trait Ref<A>: AsRef<A> + std::ops::Deref<Target = A> + Clone {
 }
 
 pub trait TreeRef<V: Measured>: Sized + Clone {
-    type NodeRef: Ref<Node<V, Self>>;
-    type TreeRef: Ref<FingerTree<V, Self>>;
+    type NodeRef: Ref<Node<V, Self>> + Measured<To = V::To>;
+    type TreeRef: Ref<FingerTree<V, Self>> + Measured<To = V::To>;
 }
 
 impl<A: Measured> TreeRef<A> for RcRef {
@@ -41,10 +41,27 @@ impl<A> Ref<A> for std::rc::Rc<A> {
         std::rc::Rc::new(a)
     }
 }
+
+impl<A: Measured> Measured for std::rc::Rc<A> {
+    type To = A::To;
+
+    fn measure(&self) -> Self::To {
+        self.as_ref().measure()
+    }
+}
+
 impl<A> Ref<A> for std::sync::Arc<A> {
     #[inline]
     fn new(a: A) -> Self {
         std::sync::Arc::new(a)
+    }
+}
+
+impl<A: Measured> Measured for std::sync::Arc<A> {
+    type To = A::To;
+
+    fn measure(&self) -> Self::To {
+        self.as_ref().measure()
     }
 }
 
@@ -75,7 +92,16 @@ enum Digit<A> {
 }
 struct DigitIter<A>(Option<Digit<A>>);
 
+#[derive(Clone)]
 pub struct Node<A: Measured, R: TreeRef<A>>(NodeInner<A, R>);
+
+impl<A: Measured, R: TreeRef<A>> Measured for Node<A, R> {
+    type To = A::To;
+
+    fn measure(&self) -> Self::To {
+        self.0.measure()
+    }
+}
 
 #[derive(Clone)]
 enum NodeInner<A, R>
@@ -96,8 +122,8 @@ where
         right: R::NodeRef,
     },
 }
-struct LiftNodeIter<R: TreeRef<A>, A: Measured, I: Iterator<Item = NodeInner<A, R>>> {
-    buff: [Option<NodeInner<A, R>>; 5],
+struct LiftNodeIter<R: TreeRef<A>, A: Measured, I: Iterator<Item = R::NodeRef>> {
+    buff: [Option<R::NodeRef>; 5],
     left: u8,
     index: u8,
     iter: I,
@@ -110,12 +136,12 @@ where
     A: Measured,
 {
     Empty,
-    Unit(NodeInner<A, R>),
+    Unit(R::NodeRef),
     Deep {
         measure: A::To,
-        prefix: Digit<NodeInner<A, R>>,
+        prefix: Digit<R::NodeRef>,
         deeper: R::TreeRef,
-        suffix: Digit<NodeInner<A, R>>,
+        suffix: Digit<R::NodeRef>,
     },
 }
 
@@ -127,7 +153,9 @@ impl<A: Measured, R: TreeRef<A>> std::iter::FromIterator<A> for FingerTree<A, R>
     fn from_iter<T: IntoIterator<Item = A>>(iter: T) -> Self {
         FingerTree(FingerTreeInner::push_many_r(
             FingerTreeInner::empty(),
-            &mut iter.into_iter().map(NodeInner::leaf),
+            &mut iter
+                .into_iter()
+                .map(|x| R::NodeRef::new(Node(NodeInner::leaf(x)))),
         ))
     }
 }
@@ -138,13 +166,13 @@ impl<A: Measured, R: TreeRef<A>> PersistMonoidIndexDeque<A> for FingerTree<A, R>
     }
 
     fn split<F: Fn(&A::To) -> bool>(&self, pred: F) -> Option<(Self, A, Self)> {
-        match self.0.clone().split_offset(A::To::empty(), &pred) {
-            None => None,
-            Some((front, NodeInner::Leaf(a), back)) => {
-                Some((FingerTree(front), a, FingerTree(back)))
-            }
-            _ => panic!("not the shallowest tree layer"),
-        }
+        self.0
+            .clone()
+            .split_offset(A::To::empty(), &pred)
+            .map_or(None, |(front, mid, back)| match &*mid {
+                Node(NodeInner::Leaf(a)) => Some((FingerTree(front), a.clone(), FingerTree(back))),
+                _ => panic!("not the shallowest tree layer"),
+            })
     }
 
     fn concat(&self, other: &Self) -> Self {
@@ -152,27 +180,31 @@ impl<A: Measured, R: TreeRef<A>> PersistMonoidIndexDeque<A> for FingerTree<A, R>
     }
 
     fn push_l(a: A, deq: &Self) -> Self {
-        FingerTree(FingerTreeInner::push_l(NodeInner::Leaf(a), deq.0.clone()))
+        FingerTree(FingerTreeInner::push_l(
+            R::NodeRef::new(Node(NodeInner::leaf(a))),
+            deq.0.clone(),
+        ))
     }
 
     fn push_r(deq: &Self, a: A) -> Self {
-        FingerTree(FingerTreeInner::push_r(deq.0.clone(), NodeInner::Leaf(a)))
+        FingerTree(FingerTreeInner::push_r(
+            deq.0.clone(),
+            R::NodeRef::new(Node(NodeInner::leaf(a))),
+        ))
     }
 
     fn view_l(&self) -> Option<(A, Self)> {
-        match self.0.clone().view_l() {
-            None => None,
-            Some((NodeInner::Leaf(a), tree)) => Some((a, FingerTree(tree))),
+        self.0.clone().view_l().map_or(None, |(a, tree)| match &*a {
+            Node(NodeInner::Leaf(a)) => Some((a.clone(), FingerTree(tree))),
             _ => panic!("not the shallowest tree layer"),
-        }
+        })
     }
 
     fn view_r(&self) -> Option<(Self, A)> {
-        match self.0.clone().view_r() {
-            None => None,
-            Some((tree, NodeInner::Leaf(a))) => Some((FingerTree(tree), a)),
+        self.0.clone().view_r().map_or(None, |(tree, a)| match &*a {
+            Node(NodeInner::Leaf(a)) => Some((FingerTree(tree), a.clone())),
             _ => panic!("not the shallowest tree layer"),
-        }
+        })
     }
 }
 
@@ -354,69 +386,46 @@ impl<A: Measured> Digit<A> {
     }
 }
 
-impl<A: Measured, R: TreeRef<A>> Digit<NodeInner<A, R>> {
-    fn to_tree(self) -> FingerTreeInner<A, R> {
-        match self {
-            Self::One([a]) => FingerTreeInner::single(a),
-            Self::Two([a, b]) => FingerTreeInner::deep(
-                Digit::One([a]),
-                R::TreeRef::new(FingerTree(FingerTreeInner::empty())),
-                Digit::One([b]),
-            ),
-            Self::Three([a, b, c]) => FingerTreeInner::deep(
-                Digit::One([a]),
-                R::TreeRef::new(FingerTree(FingerTreeInner::empty())),
-                Digit::Two([b, c]),
-            ),
-            Self::Four([a, b, c, d]) => FingerTreeInner::deep(
-                Digit::Two([a, b]),
-                R::TreeRef::new(FingerTree(FingerTreeInner::empty())),
-                Digit::Two([c, d]),
-            ),
-        }
-    }
-}
-
 impl<A: Measured, R: TreeRef<A>> NodeInner<A, R> {
     fn leaf(val: A) -> Self {
         Self::Leaf(val)
     }
 
-    fn node2(left: NodeInner<A, R>, right: NodeInner<A, R>) -> Self {
+    fn node2(left: R::NodeRef, right: R::NodeRef) -> Self {
         let measure = left.measure().merge(right.measure());
         Self::Node2 {
             measure,
-            left: R::NodeRef::new(Node(left)),
-            right: R::NodeRef::new(Node(right)),
+            left,
+            right,
         }
     }
 
-    fn node3(left: NodeInner<A, R>, middle: NodeInner<A, R>, right: NodeInner<A, R>) -> Self {
+    fn node3(left: R::NodeRef, middle: R::NodeRef, right: R::NodeRef) -> Self {
         let measure = left
             .measure()
             .merge(middle.measure())
             .merge(right.measure());
         Self::Node3 {
             measure,
-            left: R::NodeRef::new(Node(left)),
-            middle: R::NodeRef::new(Node(middle)),
-            right: R::NodeRef::new(Node(right)),
+            left,
+            middle,
+            right,
         }
     }
 
-    fn lift<I: IntoIterator<Item = Self>>(iter: I) -> LiftNodeIter<R, A, I::IntoIter> {
+    fn lift<I: IntoIterator<Item = R::NodeRef>>(iter: I) -> LiftNodeIter<R, A, I::IntoIter> {
         LiftNodeIter::new(iter.into_iter())
     }
 
-    fn unlift_digit(self) -> Digit<Self> {
+    fn unlift_digit(self) -> Digit<R::NodeRef> {
         match self {
-            Self::Node2 { left, right, .. } => Digit::Two([left.0.clone(), right.0.clone()]),
+            Self::Node2 { left, right, .. } => Digit::Two([left, right]),
             Self::Node3 {
                 left,
                 middle,
                 right,
                 ..
-            } => Digit::Three([left.0.clone(), middle.0.clone(), right.0.clone()]),
+            } => Digit::Three([left, middle, right]),
             _ => panic!("Leaf node cannot lift to digit"),
         }
     }
@@ -426,7 +435,7 @@ impl<R, A, I> LiftNodeIter<R, A, I>
 where
     R: TreeRef<A>,
     A: Measured,
-    I: Iterator<Item = NodeInner<A, R>>,
+    I: Iterator<Item = R::NodeRef>,
 {
     fn new(mut iter: I) -> Self {
         let buff = [
@@ -445,7 +454,7 @@ where
         }
     }
 
-    fn next_subtree(&mut self) -> NodeInner<A, R> {
+    fn next_subtree(&mut self) -> <Self as Iterator>::Item {
         let new = self.iter.next();
         if new.is_none() {
             self.left -= 1
@@ -460,9 +469,9 @@ impl<R, A, I> Iterator for LiftNodeIter<R, A, I>
 where
     R: TreeRef<A>,
     A: Measured,
-    I: Iterator<Item = NodeInner<A, R>>,
+    I: Iterator<Item = R::NodeRef>,
 {
-    type Item = NodeInner<A, R>;
+    type Item = R::NodeRef;
 
     fn next(&mut self) -> Option<Self::Item> {
         match self.left {
@@ -470,13 +479,13 @@ where
             2 | 4 => {
                 let left = self.next_subtree();
                 let right = self.next_subtree();
-                Some(NodeInner::node2(left, right))
+                Some(R::NodeRef::new(Node(NodeInner::node2(left, right))))
             }
             3 | 5 => {
                 let left = self.next_subtree();
                 let middle = self.next_subtree();
                 let right = self.next_subtree();
-                Some(NodeInner::node3(left, middle, right))
+                Some(R::NodeRef::new(Node(NodeInner::node3(left, middle, right))))
             }
             _ => panic!("cannot lift node with only 1 subtree"),
         }
@@ -494,16 +503,12 @@ where
     }
 
     #[inline]
-    fn single(unit: NodeInner<A, R>) -> Self {
+    fn single(unit: R::NodeRef) -> Self {
         Self::Unit(unit)
     }
 
     #[inline]
-    fn deep(
-        prefix: Digit<NodeInner<A, R>>,
-        deeper: R::TreeRef,
-        suffix: Digit<NodeInner<A, R>>,
-    ) -> Self {
+    fn deep(prefix: Digit<R::NodeRef>, deeper: R::TreeRef, suffix: Digit<R::NodeRef>) -> Self {
         let measure = prefix
             .measure()
             .merge(deeper.measure())
@@ -516,7 +521,7 @@ where
         }
     }
 
-    fn push_l(a: NodeInner<A, R>, tree: Self) -> Self {
+    fn push_l(a: R::NodeRef, tree: Self) -> Self {
         match tree {
             Self::Empty => Self::single(a),
             Self::Unit(b) => Self::deep(
@@ -532,7 +537,7 @@ where
             } => Self::deep(
                 Digit::Two([a, b]),
                 R::TreeRef::new(FingerTree(Self::push_l(
-                    NodeInner::node3(c, d, e),
+                    R::NodeRef::new(Node(NodeInner::node3(c, d, e))),
                     deeper.0.clone(),
                 ))),
                 suffix,
@@ -546,14 +551,14 @@ where
         }
     }
 
-    fn push_many_l(iter: &mut dyn Iterator<Item = NodeInner<A, R>>, tree: Self) -> Self {
+    fn push_many_l(iter: &mut dyn Iterator<Item = R::NodeRef>, tree: Self) -> Self {
         match iter.next() {
             None => tree,
             Some(a) => Self::push_l(a, Self::push_many_l(iter, tree)),
         }
     }
 
-    fn push_r(tree: Self, a: NodeInner<A, R>) -> Self {
+    fn push_r(tree: Self, a: R::NodeRef) -> Self {
         match tree {
             Self::Empty => Self::single(a),
             Self::Unit(b) => Self::deep(
@@ -570,7 +575,7 @@ where
                 prefix,
                 R::TreeRef::new(FingerTree(Self::push_r(
                     deeper.as_ref().clone().0,
-                    NodeInner::node3(e, d, c),
+                    R::NodeRef::new(Node(NodeInner::node3(e, d, c))),
                 ))),
                 Digit::Two([b, a]),
             ),
@@ -583,32 +588,37 @@ where
         }
     }
 
-    fn push_many_r(mut tree: Self, iter: &mut dyn Iterator<Item = NodeInner<A, R>>) -> Self {
+    fn push_many_r(mut tree: Self, iter: &mut dyn Iterator<Item = R::NodeRef>) -> Self {
         for a in iter {
             tree = Self::push_r(tree, a);
         }
         tree
     }
 
+    #[inline]
+    fn to_tree(iter: &mut dyn Iterator<Item = R::NodeRef>) -> Self {
+        Self::push_many_r(Self::empty(), iter)
+    }
+
     fn deep_l(
-        prefix: Option<Digit<NodeInner<A, R>>>,
+        prefix: Option<Digit<R::NodeRef>>,
         deeper: R::TreeRef,
-        suffix: Digit<NodeInner<A, R>>,
+        suffix: Digit<R::NodeRef>,
     ) -> Self {
         match prefix {
             None => match deeper.0.clone().view_l() {
                 Some((prefix, tree)) => Self::deep(
-                    prefix.unlift_digit(),
+                    prefix.0.clone().unlift_digit(),
                     R::TreeRef::new(FingerTree(tree)),
                     suffix,
                 ),
-                None => suffix.to_tree(),
+                None => Self::to_tree(&mut suffix.into_iter()),
             },
             Some(prefix) => Self::deep(prefix, deeper, suffix),
         }
     }
 
-    fn view_l(self) -> Option<(NodeInner<A, R>, Self)> {
+    fn view_l(self) -> Option<(R::NodeRef, Self)> {
         match self {
             Self::Empty => None,
             Self::Unit(a) => Some((a, Self::empty())),
@@ -625,73 +635,24 @@ where
     }
 
     fn deep_r(
-        prefix: Digit<NodeInner<A, R>>,
+        prefix: Digit<R::NodeRef>,
         deeper: R::TreeRef,
-        suffix: Option<Digit<NodeInner<A, R>>>,
+        suffix: Option<Digit<R::NodeRef>>,
     ) -> Self {
         match suffix {
             None => match deeper.0.clone().view_r() {
                 Some((tree, suffix)) => Self::deep(
                     prefix,
                     R::TreeRef::new(FingerTree(tree)),
-                    suffix.unlift_digit(),
+                    suffix.0.clone().unlift_digit(),
                 ),
-                None => prefix.to_tree(),
+                None => Self::to_tree(&mut prefix.into_iter()),
             },
             Some(suffix) => Self::deep(prefix, deeper, suffix),
         }
     }
 
-    fn split_offset<F: Fn(&A::To) -> bool>(
-        self,
-        offset: A::To,
-        pred: &F,
-    ) -> Option<(Self, NodeInner<A, R>, Self)> {
-        match self {
-            Self::Empty => None,
-            Self::Unit(a) => Some((Self::Empty, a, Self::Empty)),
-            Self::Deep {
-                prefix,
-                deeper,
-                suffix,
-                ..
-            } => {
-                let with_prefix = offset.clone().merge(prefix.measure());
-                if pred(&with_prefix) {
-                    let (obefore, a, oafter) = prefix.split_offset(offset, pred);
-                    return Some((
-                        obefore.map_or(Self::empty(), Digit::to_tree),
-                        a,
-                        Self::deep_l(oafter, deeper, suffix),
-                    ));
-                }
-                let with_deeper = with_prefix.clone().merge(deeper.measure());
-                if pred(&with_deeper) {
-                    let (before, node, after) = deeper
-                        .0
-                        .clone()
-                        .split_offset(with_prefix.clone(), pred)
-                        .unwrap();
-                    let (opr, a, osf) = node
-                        .unlift_digit()
-                        .split_offset(with_prefix.merge(before.measure()), pred);
-                    return Some((
-                        Self::deep_r(prefix, R::TreeRef::new(FingerTree(before)), opr),
-                        a,
-                        Self::deep_l(osf, R::TreeRef::new(FingerTree(after)), suffix),
-                    ));
-                }
-                let (obefore, a, oafter) = suffix.split_offset(with_deeper, pred);
-                Some((
-                    Self::deep_r(prefix, deeper, obefore),
-                    a,
-                    oafter.map_or(Self::empty(), Digit::to_tree),
-                ))
-            }
-        }
-    }
-
-    fn view_r(self) -> Option<(Self, NodeInner<A, R>)> {
+    fn view_r(self) -> Option<(Self, R::NodeRef)> {
         match self {
             Self::Empty => None,
             Self::Unit(a) => Some((Self::empty(), a)),
@@ -707,15 +668,63 @@ where
         }
     }
 
+    fn split_offset<F: Fn(&A::To) -> bool>(
+        self,
+        offset: A::To,
+        pred: &F,
+    ) -> Option<(Self, R::NodeRef, Self)> {
+        match self {
+            Self::Empty => None,
+            Self::Unit(a) => Some((Self::Empty, a, Self::Empty)),
+            Self::Deep {
+                prefix,
+                deeper,
+                suffix,
+                ..
+            } => {
+                let with_prefix = offset.clone().merge(prefix.measure());
+                if pred(&with_prefix) {
+                    let (obefore, a, oafter) = prefix.split_offset(offset, pred);
+                    return Some((
+                        obefore
+                            .map_or(Self::empty(), |digit| Self::to_tree(&mut digit.into_iter())),
+                        a,
+                        Self::deep_l(oafter, deeper, suffix),
+                    ));
+                }
+                let with_deeper = with_prefix.clone().merge(deeper.measure());
+                if pred(&with_deeper) {
+                    let (before, node, after) = deeper
+                        .0
+                        .clone()
+                        .split_offset(with_prefix.clone(), pred)
+                        .unwrap();
+                    let (opr, a, osf) = node
+                        .0
+                        .clone()
+                        .unlift_digit()
+                        .split_offset(with_prefix.merge(before.measure()), pred);
+                    return Some((
+                        Self::deep_r(prefix, R::TreeRef::new(FingerTree(before)), opr),
+                        a,
+                        Self::deep_l(osf, R::TreeRef::new(FingerTree(after)), suffix),
+                    ));
+                }
+                let (obefore, a, oafter) = suffix.split_offset(with_deeper, pred);
+                Some((
+                    Self::deep_r(prefix, deeper, obefore),
+                    a,
+                    oafter.map_or(Self::empty(), |digit| Self::to_tree(&mut digit.into_iter())),
+                ))
+            }
+        }
+    }
+
     fn concat(front: Self, back: Self) -> Self {
         Self::concat_3_way(front, &mut std::iter::empty(), back)
     }
 
-    fn concat_3_way(
-        front: Self,
-        mid: &mut dyn Iterator<Item = NodeInner<A, R>>,
-        back: Self,
-    ) -> Self {
+    fn concat_3_way(front: Self, mid: &mut dyn Iterator<Item = R::NodeRef>, back: Self) -> Self {
         match (front, back) {
             (Self::Empty, back) => Self::push_many_l(mid, back),
             (front, Self::Empty) => Self::push_many_r(front, mid),
@@ -738,7 +747,7 @@ where
                 pr1,
                 R::TreeRef::new(FingerTree(Self::concat_3_way(
                     m1.0.clone(),
-                    &mut NodeInner::lift(sf1.into_iter().chain(mid).chain(pr2)),
+                    &mut NodeInner::<A, R>::lift(sf1.into_iter().chain(mid).chain(pr2)),
                     m2.0.clone(),
                 ))),
                 sf2,
