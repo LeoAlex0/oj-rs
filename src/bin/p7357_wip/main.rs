@@ -1,5 +1,3 @@
-
-struct SplitTree {
-}
+pub struct SplitTree {}
 
 fn main() {}

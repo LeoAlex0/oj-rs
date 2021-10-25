@@ -76,19 +76,19 @@ fn main() {
     let mut stdin = stdin.lock();
     stdin.read_line(&mut buf).unwrap();
 
-    let (n, m, p) = match buf
+    let (len, num_commands, mod_by) = match buf
         .split_whitespace()
         .map(|s| s.parse::<u32>().unwrap())
         .collect::<Vec<_>>()[..]
     {
-        [n, m, p, ..] => (n, m, p),
+        [len, num_commands, mod_by, ..] => (len, num_commands, mod_by),
         _ => unreachable!(),
     };
     buf.clear();
 
     // Safe because the tree haven't create yet.
     unsafe {
-        P = p;
+        P = mod_by;
     }
 
     stdin.read_line(&mut buf).unwrap();
@@ -99,9 +99,9 @@ fn main() {
     buf.clear();
 
     let mut tree: SegTree<_, Linear> =
-        SegTree::build(n as usize, |i| (Sum(init_value[i]), Size(1)));
+        SegTree::build(len as usize, |i| (Sum(init_value[i]), Size(1)));
 
-    for _ in 0..m {
+    for _ in 0..num_commands {
         stdin.read_line(&mut buf).unwrap();
         let op = buf
             .split_whitespace()

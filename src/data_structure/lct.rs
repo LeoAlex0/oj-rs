@@ -24,7 +24,7 @@ pub trait LCTValue<V: VertexID, E: EdgeID<V>, W: Ord + Add<W> + Sub<W>>: LCTBasi
     fn update(&self, v: V, x: W) -> Self;
 }
 
-struct TrivialLCTImpl<V: VertexID, E: EdgeID<V>, W: Ord + Add<W> + Sub<W>> {
-    vertex: HashSet<V>,
-    edges: HashMap<E, W>,
+pub struct TrivialLCTImpl<V: VertexID, E: EdgeID<V>, W: Ord + Add<W> + Sub<W>> {
+    pub vertex: HashSet<V>,
+    pub edges: HashMap<E, W>,
 }

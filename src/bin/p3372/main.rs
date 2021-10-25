@@ -28,7 +28,7 @@ fn main() {
     let mut buf = String::new();
     stdin().read_line(&mut buf).unwrap();
 
-    let [n, m] = match buf
+    let [len, num_commands] = match buf
         .split_whitespace()
         .map(|x| x.parse::<u64>().unwrap())
         .take(2)
@@ -47,9 +47,9 @@ fn main() {
     buf.clear();
 
     let mut tree: SegTree<_, Plus> =
-        SegTree::build(n as usize, |i| (Sum(init[i]), Size::default()));
+        SegTree::build(len as usize, |i| (Sum(init[i]), Size::default()));
 
-    for _i in 0..m {
+    for _i in 0..num_commands {
         stdin().read_line(&mut buf).unwrap();
         match buf
             .split_whitespace()
