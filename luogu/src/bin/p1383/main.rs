@@ -1,6 +1,6 @@
 use std::io::{stdin, stdout, Write};
 
-use luogu::{data_structure::finger_tree::*, traits::monoid::Size};
+use solution::{data_structure::finger_tree::*, traits::monoid::Size};
 
 type Rope = Value<FingerTree<Value<u8>>>;
 

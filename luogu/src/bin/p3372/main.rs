@@ -1,8 +1,8 @@
 use std::io::stdin;
 
-use luogu::seg_tree::*;
-use luogu::traits::monoid::*;
-use luogu::traits::semigroup::*;
+use solution::seg_tree::*;
+use solution::traits::monoid::*;
+use solution::traits::semigroup::*;
 
 #[derive(Clone)]
 struct Plus(i64);

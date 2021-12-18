@@ -1,6 +1,7 @@
 use crate::traits::monoid::Size;
 
 use crate::data_structure::finger_tree::*;
+use paste::paste;
 
 extern crate test;
 
@@ -47,38 +48,51 @@ fn concat() {
     }
 }
 
-#[bench]
-fn split_1e4(b: &mut test::Bencher) {
-    let tree: FingerTree<_> = (0..1e4 as usize).map(Value).collect();
-    b.iter(|| tree.split(|l| l > &Size(5e3 as usize)));
+macro_rules! bench_split_ref {
+    ($len:literal,$ref:ty) => {
+        paste! {
+            #[bench]
+            fn [<split_ $len _ $ref:snake>](b: &mut test::Bencher) {
+                let tree: FingerTree<_,$ref> = (0..$len as usize).map(Value).collect();
+                b.iter(|| tree.split(|l| l > &Size($len as usize >> 1)));
+            }
+        }
+    };
 }
 
-#[bench]
-fn split_1e5(b: &mut test::Bencher) {
-    let tree: FingerTree<_> = (0..1e5 as usize).map(Value).collect();
-    b.iter(|| tree.split(|l| l > &Size(5e4 as usize)));
+macro_rules! bench_concat_ref {
+    ($len:literal,$ref:ty) => {
+        paste! {
+            #[bench]
+            fn [<concat_ $len _ $ref:snake>](b: &mut test::Bencher) {
+                let tree: FingerTree<_,$ref> = (0..$len as usize).map(Value).collect();
+                b.iter(|| tree.concat(&tree));
+            }
+        }
+    };
 }
 
-#[bench]
-fn split_1e6(b: &mut test::Bencher) {
-    let tree: FingerTree<_> = (0..1e6 as usize).map(Value).collect();
-    b.iter(|| tree.split(|l| l > &Size(5e5 as usize)));
+macro_rules! bench_split {
+    ($len :literal) => {
+        bench_split_ref!($len, RcRef);
+        bench_split_ref!($len, ArcRef);
+    };
 }
 
-#[bench]
-fn concat_1e4(b: &mut test::Bencher) {
-    let tree: FingerTree<_> = (0..1e4 as usize).map(Value).collect();
-    b.iter(|| tree.concat(&tree));
+macro_rules! bench_concat {
+    ($len:literal) => {
+        bench_concat_ref!($len, RcRef);
+        bench_concat_ref!($len, ArcRef);
+    };
 }
 
-#[bench]
-fn concat_1e5(b: &mut test::Bencher) {
-    let tree: FingerTree<_> = (0..1e5 as usize).map(Value).collect();
-    b.iter(|| tree.concat(&tree));
+macro_rules! benches {
+    ($($len:literal),*) => {
+        $(
+            bench_split!($len);
+            bench_concat!($len);
+        )*
+    };
 }
 
-#[bench]
-fn concat_1e6(b: &mut test::Bencher) {
-    let tree: FingerTree<_> = (0..1e6 as usize).map(Value).collect();
-    b.iter(|| tree.concat(&tree));
-}
+benches![1e4, 1e5, 1e6, 1e7];

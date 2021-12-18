@@ -5,3 +5,8 @@
 
 # Sample Input/Output for testing
 /samples
+
+*/target
+
+# workspace use a general lock
+*/Cargo.lock

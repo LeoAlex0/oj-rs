@@ -1,5 +1,5 @@
-use luogu::seg_tree::*;
-use luogu::traits::*;
+use solution::seg_tree::*;
+use solution::traits::*;
 
 use std::io::{stdin, BufRead};
 
