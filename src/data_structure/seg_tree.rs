@@ -1,4 +1,4 @@
-use crate::traits::*;
+use super::super::traits::*;
 
 use std::{
     cmp::{max, min},
@@ -16,6 +16,15 @@ impl<A: Semigroup, B: Semigroup, MA: Applier<A>, MB: Applier<B>> Applier<(A, B)>
     fn apply(&self, (a, b): (A, B)) -> (A, B) {
         let (ma, mb) = self;
         (ma.apply(a), mb.apply(b))
+    }
+}
+
+impl<A: Semigroup, M: Applier<A>> Applier<A> for Option<M> {
+    fn apply(&self, to: A) -> A {
+        match self {
+            None => to,
+            Some(f) => f.apply(to),
+        }
     }
 }
 
