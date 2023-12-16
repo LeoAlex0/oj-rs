@@ -10,9 +10,5 @@ edition = "2021"
 opt-level = 2
 codegen-units = 1
 
-[profile.test]
-opt-level = 2
-codegen-units = 1
-
 [dependencies]
 paste = "*"
