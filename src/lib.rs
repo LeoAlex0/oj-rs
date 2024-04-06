@@ -1,5 +1,3 @@
-#![feature(test)]
-
 pub mod traits;
 
 pub mod data_structure;
