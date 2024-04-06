@@ -10,3 +10,7 @@
 
 # workspace use a general lock
 */Cargo.lock
+
+# direnv & flake temporary files
+.direnv
+/result
