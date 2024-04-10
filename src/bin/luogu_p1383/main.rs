@@ -1,6 +1,7 @@
-use std::io::{stdin, stdout, Write};
+extern crate solution;
 
 use solution::{data_structure::finger_tree::*, traits::monoid::Size};
+use std::io::{stdin, stdout, Write};
 
 type Rope = Value<FingerTree<Value<u8>>>;
 

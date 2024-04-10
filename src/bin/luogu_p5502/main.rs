@@ -1,3 +1,5 @@
+extern crate solution;
+
 use std::cmp::max;
 use std::io::{stdin, stdout, Result, Write};
 use std::iter::Iterator;

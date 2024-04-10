@@ -1,6 +1,7 @@
+extern crate solution;
+
 use solution::seg_tree::*;
 use solution::traits::*;
-
 use std::io::{stdin, BufRead};
 
 static mut P: u32 = 0;

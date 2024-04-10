@@ -1,3 +1,5 @@
+extern crate solution;
+
 use std::io::stdin;
 
 use solution::seg_tree::*;
