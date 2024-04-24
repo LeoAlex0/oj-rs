@@ -1,4 +1,5 @@
-use super::super::traits::*;
+use crate::traits::monoid::Monoid;
+use crate::traits::semigroup::Semigroup;
 
 use std::{
     cmp::{max, min},

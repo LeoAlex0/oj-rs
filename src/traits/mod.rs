@@ -1,7 +1,3 @@
-pub mod semigroup;
-pub use semigroup::Semigroup;
-
-pub mod monoid;
-pub use monoid::Monoid;
-
 pub mod foldable;
+pub mod monoid;
+pub mod semigroup;

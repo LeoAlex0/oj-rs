@@ -2,7 +2,7 @@ extern crate solution;
 
 use std::io::stdin;
 
-use solution::seg_tree::*;
+use solution::data_structure::seg_tree::*;
 use solution::traits::monoid::*;
 use solution::traits::semigroup::*;
 

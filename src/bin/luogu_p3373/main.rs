@@ -1,7 +1,8 @@
 extern crate solution;
 
-use solution::seg_tree::*;
-use solution::traits::*;
+use solution::data_structure::seg_tree::*;
+use solution::traits::monoid::Monoid;
+use solution::traits::semigroup::Semigroup;
 use std::io::{stdin, BufRead};
 
 static mut P: u32 = 0;

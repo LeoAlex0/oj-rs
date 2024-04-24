@@ -11,6 +11,16 @@ impl<A: Semigroup, B: Semigroup> Semigroup for (A, B) {
         (A::merge(a, oa), B::merge(b, ob))
     }
 }
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
+pub struct Identity<V>(pub V);
+
+impl<V> Semigroup for Identity<V> {
+    fn merge(self, _: Self) -> Self {
+        self
+    }
+}
+
 macro_rules! impl_semigroup {
     ($t:ty,$k:path,$v:expr) => {
         impl<T: $k> Semigroup for $t {
