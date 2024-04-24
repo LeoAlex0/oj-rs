@@ -29,7 +29,35 @@ impl<A: Semigroup, M: Applier<A>> Applier<A> for Option<M> {
     }
 }
 
-#[derive(Debug)]
+pub struct Iter<V, M> {
+    stack: Vec<(M, Rc<SegTree<V, M>>)>,
+}
+
+impl<V: Semigroup + Clone, M: Applier<V> + Semigroup + Clone> Iterator for Iter<V, M> {
+    type Item = V;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some((prefix, tree)) = self.stack.pop() {
+            match tree.as_ref() {
+                SegTree::Unit(v) => return Some(prefix.apply(v.clone())),
+                SegTree::Branch {
+                    modifier,
+                    right,
+                    left,
+                    ..
+                } => {
+                    let prefix = prefix.merge(modifier.clone());
+                    self.stack.push((prefix.clone(), right.clone()));
+                    self.stack.push((prefix, left.clone()));
+                }
+                SegTree::Empty => (),
+            };
+        }
+        None
+    }
+}
+
+#[derive(Debug, Clone)]
 pub enum SegTree<V, M> {
     Empty,
     Unit(V),
@@ -113,6 +141,12 @@ impl<V: Monoid + Clone, M: Applier<V> + Monoid + Clone> SegTree<V, M> {
         Self::build_inner(0, len, init)
     }
 
+    pub fn iter(&self) -> Iter<V, M> {
+        Iter {
+            stack: vec![(M::empty(), Rc::new(self.clone()))],
+        }
+    }
+
     pub fn query(&self, range: Range<usize>) -> V {
         match self {
             Self::Empty => V::empty(),
@@ -174,7 +208,7 @@ impl<V: Monoid + Clone, M: Applier<V> + Monoid + Clone> SegTree<V, M> {
                 left,
                 right,
             } => {
-                if range.start == 0 && *size <= range.end {
+                if range.start <= 0 && *size <= range.end {
                     Self::Branch {
                         size: *size,
                         value: m.apply(value.clone()),
