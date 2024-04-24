@@ -3,10 +3,10 @@ extern crate solution;
 use std::{array, borrow::Cow, io::BufRead, sync::OnceLock};
 
 #[derive(Clone, PartialEq, Eq)]
-struct TransposeU8<'a>(Cow<'a, [u8; u8::MAX as usize + 1]>);
+struct TransposeU8<'a>(Cow<'a, [u8; 101]>);
 impl<'a> solution::traits::semigroup::Semigroup for TransposeU8<'a> {
     fn merge(mut self, other: Self) -> Self {
-        let identity = IDENTITY_TRANSPOSE.get().unwrap();
+        let identity = IDENTITY_TRANSPOSE.get_or_init(identity_transpose_factory);
         if other == *identity {
             return self;
         }
@@ -14,7 +14,7 @@ impl<'a> solution::traits::semigroup::Semigroup for TransposeU8<'a> {
             return other;
         }
 
-        for l in u8::MIN..=u8::MAX {
+        for l in u8::MIN..=100 {
             let m = other.0[l as usize];
             if l == m {
                 continue;
@@ -47,6 +47,9 @@ impl<'a> solution::traits::semigroup::Semigroup for TransposeU8<'a> {
 }
 
 static IDENTITY_TRANSPOSE: OnceLock<TransposeU8> = OnceLock::new();
+fn identity_transpose_factory() -> TransposeU8<'static> {
+    TransposeU8(Cow::Owned(array::from_fn(|i| i as u8)))
+}
 
 impl<'a> TransposeU8<'a> {
     fn assign(mut self, x: u8, y: u8) -> Self {
@@ -56,7 +59,7 @@ impl<'a> TransposeU8<'a> {
 
     fn identity() -> Self {
         IDENTITY_TRANSPOSE
-            .get_or_init(|| TransposeU8(Cow::Owned(array::from_fn(|i| i as u8))))
+            .get_or_init(identity_transpose_factory)
             .clone()
         // Self(array::from_fn(|i| i as u8)) // identity transpose
     }
