@@ -14,7 +14,7 @@
       {
         defaultPackage = naersk-lib.buildPackage ./.;
         devShell = with pkgs; mkShell {
-          buildInputs = [ cargo rustc rustfmt pre-commit rustPackages.clippy gnuplot ];
+          buildInputs = [ cargo rustc rustfmt pre-commit rustPackages.clippy gnuplot linuxPackages.perf ];
           RUST_SRC_PATH = rustPlatform.rustLibSrc;
         };
       });
