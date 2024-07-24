@@ -14,3 +14,15 @@
 # direnv & flake temporary files
 .direnv
 /result
+
+# packed source
+out*
+
+# generated input
+*.out
+*.in
+*.ans
+
+# profile data
+perf*
+gecko*

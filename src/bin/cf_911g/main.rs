@@ -26,23 +26,6 @@ impl<'a> solution::traits::semigroup::Semigroup for TransposeU8<'a> {
         }
 
         self
-        // let intrested_keys = self.0.keys().chain(other.0.keys()).collect::<BTreeSet<_>>();
-
-        // Self(
-        //     intrested_keys
-        //         .into_iter()
-        //         .filter_map(|l| {
-        //             let m = other.0.get(l).unwrap_or(l);
-        //             let r = self.0.get(m).unwrap_or(m);
-
-        //             if *l == *r {
-        //                 None
-        //             } else {
-        //                 Some((*l, *r))
-        //             }
-        //         })
-        //         .collect(),
-        // )
     }
 }
 

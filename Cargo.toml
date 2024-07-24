@@ -12,6 +12,9 @@ name = "solution"
 [dev-dependencies]
 criterion = { version = "0.4", features = ["html_reports"] }
 
+[profile.release]
+opt-level = 2 # same as codeforces runtime https://codeforces.com/blog/entry/121114
+
 [[bench]]
 name = "finger_tree"
 harness = false
