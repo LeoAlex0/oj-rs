@@ -1,69 +1,36 @@
 extern crate solution;
 
-use std::{array, borrow::Cow, io::BufRead, sync::OnceLock};
+use std::io::BufRead;
 
-#[derive(Clone, PartialEq, Eq)]
-struct TransposeU8<'a>(Cow<'a, [u8; 101]>);
-impl<'a> solution::traits::semigroup::Semigroup for TransposeU8<'a> {
-    fn merge(mut self, other: Self) -> Self {
-        let identity = IDENTITY_TRANSPOSE.get_or_init(identity_transpose_factory);
-        if other == *identity {
-            return self;
+#[cfg(all(any(target_arch = "x86", target_arch = "x86_64"),))]
+#[target_feature(enable = "avx2")]
+unsafe fn update(arr: &mut Vec<u8>, l: usize, r: usize, x: u8, y: u8) {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+    let mut p = arr[l - 1..r].as_mut_ptr();
+    let end = arr[r..].as_mut_ptr();
+    let mx = _mm256_set1_epi8(x as i8);
+    let my = _mm256_set1_epi8(y as i8);
+
+    while p.align_offset(32) != 0 && p < end {
+        if *p == x {
+            *p = y
         }
-        if self == *identity {
-            return other;
+        p = p.offset(1);
+    }
+    while p.offset(32) < end {
+        let v = _mm256_load_si256(p as *const _);
+        let v = _mm256_blendv_epi8(v, my, _mm256_cmpeq_epi8(v, mx));
+        _mm256_store_si256(p as *mut _, v);
+        p = p.offset(32);
+    }
+    while p < end {
+        if *p == x {
+            *p = y
         }
-
-        for l in u8::MIN..=100 {
-            let m = other.0[l as usize];
-            if l == m {
-                continue;
-            }
-            if self.0[l as usize] == self.0[m as usize] {
-                continue;
-            }
-            self.0.to_mut()[l as usize] = self.0[m as usize];
-        }
-
-        self
-    }
-}
-
-static IDENTITY_TRANSPOSE: OnceLock<TransposeU8> = OnceLock::new();
-fn identity_transpose_factory() -> TransposeU8<'static> {
-    TransposeU8(Cow::Owned(array::from_fn(|i| i as u8)))
-}
-
-impl<'a> TransposeU8<'a> {
-    fn assign(mut self, x: u8, y: u8) -> Self {
-        self.0.to_mut()[x as usize] = y;
-        self
-    }
-
-    fn identity() -> Self {
-        IDENTITY_TRANSPOSE
-            .get_or_init(identity_transpose_factory)
-            .clone()
-        // Self(array::from_fn(|i| i as u8)) // identity transpose
-    }
-}
-
-impl<'a> solution::traits::monoid::Monoid for TransposeU8<'a> {
-    fn empty() -> Self {
-        Self::identity()
-    }
-}
-
-impl<'a>
-    solution::data_structure::seg_tree::Applier<Option<solution::traits::semigroup::Identity<u8>>>
-    for TransposeU8<'a>
-{
-    fn apply(
-        &self,
-        to: Option<solution::traits::semigroup::Identity<u8>>,
-    ) -> Option<solution::traits::semigroup::Identity<u8>> {
-        // to.map(|to| solution::traits::semigroup::Identity(*self.0.get(&to.0).unwrap_or(&to.0)))
-        to.map(|to| solution::traits::semigroup::Identity(self.0[to.0 as usize]))
+        p = p.offset(1);
     }
 }
 
@@ -72,18 +39,13 @@ fn main() {
 
     let n: usize = lines.next().unwrap().unwrap().trim().parse().unwrap();
 
-    let array: Vec<u8> = lines
+    let mut array: Vec<u8> = lines
         .next()
         .unwrap()
         .unwrap()
         .split_whitespace()
         .map(|word| word.parse().unwrap())
         .collect();
-    let mut tree: solution::data_structure::seg_tree::SegTree<_, TransposeU8> =
-        solution::data_structure::seg_tree::SegTree::build(n, |i| {
-            Some(solution::traits::semigroup::Identity(array[i]))
-        });
-    drop(array);
 
     let _q: usize = lines.next().unwrap().unwrap().trim().parse().unwrap();
     // let mut i: usize = 0;
@@ -94,7 +56,7 @@ fn main() {
             .map(|word| word.parse::<usize>().unwrap())
             .collect::<Vec<_>>()[..]
         {
-            tree = tree.apply(l - 1..r, TransposeU8::identity().assign(x as u8, y as u8));
+            unsafe { update(&mut array, l, r, x as u8, y as u8) }
         }
 
         // i += 1;
@@ -103,9 +65,9 @@ fn main() {
         // }
     }
 
-    let ans = tree
+    let ans = array
         .iter()
-        .map(|i| i.unwrap().0.to_string())
+        .map(|i| i.to_string())
         .collect::<Vec<_>>()
         .join(" ");
 
