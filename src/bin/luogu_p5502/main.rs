@@ -4,9 +4,9 @@ use std::cmp::max;
 fn main() {
     let mut input = Scanner::stdin();
     let mut output = Output::stdout();
-    let n: usize = input.next();
+    let n: usize = input.read();
 
-    let (ans, _) = (0..n).map(|_| input.next()).zip(0usize..).fold(
+    let (ans, _) = (0..n).map(|_| input.read()).zip(0usize..).fold(
         (0u64, Vec::new()),
         |(ans, mut que), (cur, i)| {
             que.push((i, cur));

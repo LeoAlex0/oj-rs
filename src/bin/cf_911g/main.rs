@@ -1,8 +1,8 @@
 use solution::io::{Output, Scanner};
 
-#[cfg(all(any(target_arch = "x86", target_arch = "x86_64"),))]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
-unsafe fn update(arr: &mut Vec<u8>, l: usize, r: usize, x: u8, y: u8) {
+unsafe fn update(arr: &mut [u8], l: usize, r: usize, x: u8, y: u8) {
     #[cfg(target_arch = "x86")]
     use std::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
@@ -35,16 +35,16 @@ unsafe fn update(arr: &mut Vec<u8>, l: usize, r: usize, x: u8, y: u8) {
 fn main() {
     let mut input = Scanner::stdin();
 
-    let n: usize = input.next();
+    let n: usize = input.read();
 
-    let mut array: Vec<u8> = (0..n).map(|_| input.next()).collect();
+    let mut array: Vec<u8> = (0..n).map(|_| input.read()).collect();
 
-    let q: usize = input.next();
+    let q: usize = input.read();
     for _ in 0..q {
-        let l: usize = input.next();
-        let r: usize = input.next();
-        let x: u8 = input.next();
-        let y: u8 = input.next();
+        let l: usize = input.read();
+        let r: usize = input.read();
+        let x: u8 = input.read();
+        let y: u8 = input.read();
         unsafe { update(&mut array, l, r, x, y) }
     }
 

@@ -170,12 +170,13 @@ impl<A: Measured, R: TreeRef<A>> PersistMonoidIndexDeque<A> for FingerTree<A, R>
     }
 
     fn split<F: Fn(&A::To) -> bool>(&self, pred: F) -> Option<(Self, A, Self)> {
-        self.0.clone().split_offset(A::To::empty(), &pred).and_then(
-            |(front, mid, back)| match &*mid {
-                Node(NodeInner::Leaf(a)) => Some((FingerTree(front), a.clone(), FingerTree(back))),
+        self.0
+            .clone()
+            .split_offset(A::To::empty(), &pred)
+            .map(|(front, mid, back)| match &*mid {
+                Node(NodeInner::Leaf(a)) => (FingerTree(front), a.clone(), FingerTree(back)),
                 _ => panic!("not the shallowest tree layer"),
-            },
-        )
+            })
     }
 
     fn concat(&self, other: &Self) -> Self {
@@ -197,15 +198,15 @@ impl<A: Measured, R: TreeRef<A>> PersistMonoidIndexDeque<A> for FingerTree<A, R>
     }
 
     fn view_l(&self) -> Option<(A, Self)> {
-        self.0.clone().view_l().and_then(|(a, tree)| match &*a {
-            Node(NodeInner::Leaf(a)) => Some((a.clone(), FingerTree(tree))),
+        self.0.clone().view_l().map(|(a, tree)| match &*a {
+            Node(NodeInner::Leaf(a)) => (a.clone(), FingerTree(tree)),
             _ => panic!("not the shallowest tree layer"),
         })
     }
 
     fn view_r(&self) -> Option<(Self, A)> {
-        self.0.clone().view_r().and_then(|(tree, a)| match &*a {
-            Node(NodeInner::Leaf(a)) => Some((FingerTree(tree), a.clone())),
+        self.0.clone().view_r().map(|(tree, a)| match &*a {
+            Node(NodeInner::Leaf(a)) => (FingerTree(tree), a.clone()),
             _ => panic!("not the shallowest tree layer"),
         })
     }

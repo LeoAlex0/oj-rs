@@ -18,7 +18,7 @@ impl Scanner {
         Self { input, index: 0 }
     }
 
-    pub fn next<T>(&mut self) -> T
+    pub fn read<T>(&mut self) -> T
     where
         T: FromStr,
         T::Err: std::fmt::Debug,
@@ -85,9 +85,9 @@ mod tests {
     fn scanner_reads_whitespace_separated_tokens() {
         let mut scanner = Scanner::new(b"  3\n-5 hello ".to_vec());
 
-        assert_eq!(scanner.next::<usize>(), 3);
-        assert_eq!(scanner.next::<i32>(), -5);
-        assert_eq!(scanner.next::<String>(), "hello");
+        assert_eq!(scanner.read::<usize>(), 3);
+        assert_eq!(scanner.read::<i32>(), -5);
+        assert_eq!(scanner.read::<String>(), "hello");
     }
 
     #[test]

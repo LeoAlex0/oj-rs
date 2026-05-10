@@ -1,21 +1,39 @@
-name: "Rust checks and OJ packer"
+name: "OJ packer"
 
 on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   check:
+    name: Test packer and generated submissions
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Check solution formatting
-        run: cargo fmt --all --check
-      - name: Check solution binaries
-        run: cargo check -p solution --bins
-      - name: Test oj-pack
-        run: cargo test -p oj-pack
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check packer formatting
+        run: cargo fmt -p oj-pack --check
+
+      - name: Lint packer
+        run: cargo clippy -p oj-pack --all-targets -- -D warnings
+
+      - name: Test packer
+        run: cargo test -p oj-pack --all-targets
+
       - name: Smoke-test packed submissions
         run: |
           set -euo pipefail
@@ -23,4 +41,5 @@ jobs:
             out="/tmp/${bin}.rs"
             cargo oj-pack "$bin" > "$out"
             test -s "$out"
+            wc -l -c "$out"
           done

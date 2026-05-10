@@ -24,19 +24,19 @@ impl Applier<(Sum<i64>, Size)> for Plus {
 
 fn main() {
     let mut input = Scanner::stdin();
-    let len: usize = input.next();
-    let num_commands: usize = input.next();
-    let init: Vec<i64> = (0..len).map(|_| input.next()).collect();
+    let len: usize = input.read();
+    let num_commands: usize = input.read();
+    let init: Vec<i64> = (0..len).map(|_| input.read()).collect();
 
     let mut tree: SegTree<_, Plus> = SegTree::build(len, |i| (Sum(init[i]), Size::default()));
 
     for _ in 0..num_commands {
-        let op: u8 = input.next();
-        let x: usize = input.next();
-        let y: usize = input.next();
+        let op: u8 = input.read();
+        let x: usize = input.read();
+        let y: usize = input.read();
         match op {
             1 => {
-                let k: i64 = input.next();
+                let k: i64 = input.read();
                 tree = tree.apply(x - 1..y, Plus(k));
             }
             2 => println!("{}", tree.query(x - 1..y).0 .0),

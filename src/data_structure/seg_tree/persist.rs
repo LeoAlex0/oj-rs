@@ -208,7 +208,7 @@ impl<V: Monoid + Clone, M: Applier<V> + Monoid + Clone> SegTree<V, M> {
                 left,
                 right,
             } => {
-                if range.start <= 0 && *size <= range.end {
+                if range.start == 0 && *size <= range.end {
                     Self::Branch {
                         size: *size,
                         value: m.apply(value.clone()),
