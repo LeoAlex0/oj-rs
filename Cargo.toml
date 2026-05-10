@@ -19,10 +19,10 @@ criterion = { version = "0.4", features = ["html_reports"] }
 [profile.release]
 opt-level = 2 # same as codeforces runtime https://codeforces.com/blog/entry/121114
 
+# Criterion provides its own benchmark main via criterion_main!, so the default
+# libtest harness must be disabled.
+# https://bheisler.github.io/criterion.rs/book/getting_started.html
 [[bench]]
-name = "finger_tree"
-harness = false
-
-[[bench]]
-name = "seg_tree"
+name = "criterion"
+path = "benches/criterion/00-main.rs"
 harness = false

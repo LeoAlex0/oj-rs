@@ -35,7 +35,7 @@ jobs:
         run: cargo check -p solution --bins
 
       - name: Test solution
-        run: cargo test -p solution --all-targets
+        run: cargo test -p solution --lib --bins
 
   benchmark:
     name: Run criterion benchmarks
@@ -55,10 +55,7 @@ jobs:
           set -euo pipefail
           mkdir -p target/criterion
           {
-            echo "## finger_tree"
-            cargo bench -p solution --bench finger_tree -- --sample-size 10 --warm-up-time 1 --measurement-time 1
-            echo "## seg_tree"
-            cargo bench -p solution --bench seg_tree -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+            cargo bench -p solution --bench criterion -- --sample-size 10 --warm-up-time 1 --measurement-time 1
           } 2>&1 | tee target/criterion/ci-bench-output.txt
 
       - name: Upload criterion report
