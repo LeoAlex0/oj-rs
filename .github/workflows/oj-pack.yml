@@ -1,0 +1,26 @@
+name: "Rust checks and OJ packer"
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check solution formatting
+        run: cargo fmt --all --check
+      - name: Check solution binaries
+        run: cargo check -p solution --bins
+      - name: Test oj-pack
+        run: cargo test -p oj-pack
+      - name: Smoke-test packed submissions
+        run: |
+          set -euo pipefail
+          for bin in $(cargo oj-pack --list 2>&1); do
+            out="/tmp/${bin}.rs"
+            cargo oj-pack "$bin" > "$out"
+            test -s "$out"
+          done

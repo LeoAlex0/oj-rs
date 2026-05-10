@@ -1,15 +1,13 @@
 # Added by cargo
 #
 # already existing elements were commented out
-/target
+target/
 
 # Sample Input/Output for testing
 /samples
 
-*/target
-
 # workspace use a general lock
-*/Cargo.lock
+**/Cargo.lock
 
 # direnv & flake temporary files
 .direnv

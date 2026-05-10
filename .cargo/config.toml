@@ -1,0 +1,2 @@
+[alias]
+oj-pack = "run --quiet -p oj-pack --"

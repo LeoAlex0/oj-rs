@@ -1,4 +1,4 @@
-use crate::traits::{monoid::Size, monoid::Monoid, semigroup::Semigroup};
+use crate::traits::{monoid::Monoid, monoid::Size, semigroup::Semigroup};
 
 // Traits
 
