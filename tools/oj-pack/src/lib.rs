@@ -665,17 +665,19 @@ impl Library {
     }
 
     fn render(&self, kept: &BTreeSet<ItemKey>) -> Result<Vec<Item>, BoxError> {
-        self.render_module_items(&self.root, kept, true)
+        let kept_names = self.kept_names(kept);
+        self.render_module_items(&self.root, kept, &kept_names, true)
     }
 
     fn render_module_items(
         &self,
         module: &Module,
         kept: &BTreeSet<ItemKey>,
+        kept_names: &BTreeSet<String>,
         is_root: bool,
     ) -> Result<Vec<Item>, BoxError> {
         let mut out = Vec::new();
-        let module_has_code = module_contains_kept(module, kept);
+        let module_has_code = self.module_contains_output(module, kept, kept_names);
         for item in &module.items {
             match item {
                 ModuleItem::Use(item) if module_has_code => out.push(Item::Use(item.clone())),
@@ -684,8 +686,10 @@ impl Library {
                     out.push(self.records[*key].item.clone());
                 }
                 ModuleItem::Item(_) => {}
-                ModuleItem::Child(child) if module_contains_kept(child, kept) => {
-                    let child_items = self.render_module_items(child, kept, false)?;
+                ModuleItem::Child(child)
+                    if self.module_contains_output(child, kept, kept_names) =>
+                {
+                    let child_items = self.render_module_items(child, kept, kept_names, false)?;
                     let ident = Ident::new(
                         child.name.as_deref().unwrap_or("root"),
                         proc_macro2::Span::call_site(),
@@ -704,6 +708,34 @@ impl Library {
             return Ok(Vec::new());
         }
         Ok(out)
+    }
+
+    fn module_contains_output(
+        &self,
+        module: &Module,
+        kept: &BTreeSet<ItemKey>,
+        kept_names: &BTreeSet<String>,
+    ) -> bool {
+        module.items.iter().any(|item| match item {
+            ModuleItem::Item(key) => kept.contains(key),
+            ModuleItem::Child(child) => self.module_contains_output(child, kept, kept_names),
+            ModuleItem::Use(item) if is_pub_use(item) => {
+                self.reexport_reaches_kept(item, &module.path, kept, kept_names)
+            }
+            ModuleItem::Use(_) => false,
+        })
+    }
+
+    fn reexport_reaches_kept(
+        &self,
+        item: &ItemUse,
+        module_path: &[String],
+        kept: &BTreeSet<ItemKey>,
+        kept_names: &BTreeSet<String>,
+    ) -> bool {
+        let mut exported = Vec::new();
+        collect_reexport_glob_roots(&item.tree, module_path, kept_names, self, &mut exported);
+        exported.into_iter().any(|key| kept.contains(&key))
     }
 }
 
@@ -1001,8 +1033,7 @@ fn collect_reexport_roots(
 ) {
     match tree {
         UseTree::Path(path) => {
-            let mut child_path = module_path.to_vec();
-            child_path.push(path.ident.to_string());
+            let child_path = resolve_use_path_segment(module_path, &path.ident);
             match path.tree.as_ref() {
                 UseTree::Glob(_) => {
                     if let Some(index) = library.modules.get(&child_path) {
@@ -1017,6 +1048,15 @@ fn collect_reexport_roots(
         UseTree::Name(item) => {
             let item_name = item.ident.to_string();
             if name.is_none_or(|name| name == item_name) {
+                for key in library.exported_matching(module_path, Some(&item_name)) {
+                    out.push(key);
+                }
+            }
+        }
+        UseTree::Rename(item) => {
+            let item_name = item.ident.to_string();
+            let alias = item.rename.to_string();
+            if name.is_none_or(|name| name == alias) {
                 for key in library.exported_matching(module_path, Some(&item_name)) {
                     out.push(key);
                 }
@@ -1040,8 +1080,7 @@ fn collect_reexport_glob_roots(
 ) {
     match tree {
         UseTree::Path(path) => {
-            let mut child_path = module_path.to_vec();
-            child_path.push(path.ident.to_string());
+            let child_path = resolve_use_path_segment(module_path, &path.ident);
             match path.tree.as_ref() {
                 UseTree::Glob(_) => {
                     if let Some(index) = library.modules.get(&child_path) {
@@ -1061,6 +1100,13 @@ fn collect_reexport_glob_roots(
                 }
             }
         }
+        UseTree::Rename(item) => {
+            if used_names.contains(&item.rename.to_string()) {
+                for key in library.exported_matching(module_path, Some(&item.ident.to_string())) {
+                    out.push(key);
+                }
+            }
+        }
         UseTree::Group(group) => {
             for item in &group.items {
                 collect_reexport_glob_roots(item, module_path, used_names, library, out);
@@ -1070,12 +1116,21 @@ fn collect_reexport_glob_roots(
     }
 }
 
-fn module_contains_kept(module: &Module, kept: &BTreeSet<ItemKey>) -> bool {
-    module.items.iter().any(|item| match item {
-        ModuleItem::Item(key) => kept.contains(key),
-        ModuleItem::Child(child) => module_contains_kept(child, kept),
-        ModuleItem::Use(_) => false,
-    })
+fn resolve_use_path_segment(module_path: &[String], ident: &Ident) -> Vec<String> {
+    match ident.to_string().as_str() {
+        "crate" => Vec::new(),
+        "self" => module_path.to_vec(),
+        "super" => {
+            let mut parent = module_path.to_vec();
+            parent.pop();
+            parent
+        }
+        name => {
+            let mut child = module_path.to_vec();
+            child.push(name.to_string());
+            child
+        }
+    }
 }
 
 struct RewriteCrateName {

@@ -1,19 +1,14 @@
-extern crate solution;
-
+use solution::io::{Output, Scanner};
 use std::cmp::max;
-use std::io::{stdin, stdout, Result, Write};
-use std::iter::Iterator;
 
-fn main() -> Result<()> {
-    let mut buf = String::new();
-    stdin().read_line(&mut String::new()).ok();
-    stdin().read_line(&mut buf).ok();
+fn main() {
+    let mut input = Scanner::stdin();
+    let mut output = Output::stdout();
+    let n: usize = input.next();
 
-    let (ans, _) = buf
-        .split_whitespace()
-        .map(|word| word.parse().unwrap())
-        .zip(0usize..)
-        .fold((0u64, Vec::new()), |(ans, mut que), (cur, i)| {
+    let (ans, _) = (0..n).map(|_| input.next()).zip(0usize..).fold(
+        (0u64, Vec::new()),
+        |(ans, mut que), (cur, i)| {
             que.push((i, cur));
             let (new_ans, new_que): (Vec<_>, _) = que
                 .iter()
@@ -28,8 +23,9 @@ fn main() -> Result<()> {
                 .flatten()
                 .unzip();
             (max(ans, *new_ans.iter().max().unwrap()), new_que)
-        });
-    stdout().write_all(ans.to_string().as_bytes())
+        },
+    );
+    output.println(ans);
 }
 
 fn gcd(a: u64, b: u64) -> u64 {

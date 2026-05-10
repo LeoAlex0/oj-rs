@@ -1,10 +1,6 @@
-extern crate solution;
-
-use std::io::stdin;
-
-use solution::data_structure::seg_tree::*;
-use solution::traits::monoid::*;
-use solution::traits::semigroup::*;
+use solution::data_structure::seg_tree::prelude::*;
+use solution::io::Scanner;
+use solution::traits::prelude::*;
 
 #[derive(Clone)]
 struct Plus(i64);
@@ -27,41 +23,24 @@ impl Applier<(Sum<i64>, Size)> for Plus {
 }
 
 fn main() {
-    let mut buf = String::new();
-    stdin().read_line(&mut buf).unwrap();
+    let mut input = Scanner::stdin();
+    let len: usize = input.next();
+    let num_commands: usize = input.next();
+    let init: Vec<i64> = (0..len).map(|_| input.next()).collect();
 
-    let [len, num_commands] = match buf
-        .split_whitespace()
-        .map(|x| x.parse::<u64>().unwrap())
-        .take(2)
-        .collect::<Vec<_>>()[..]
-    {
-        [n, m] => [n, m],
-        _ => unreachable!(),
-    };
-    buf.clear();
+    let mut tree: SegTree<_, Plus> = SegTree::build(len, |i| (Sum(init[i]), Size::default()));
 
-    stdin().read_line(&mut buf).unwrap();
-    let init: Vec<_> = buf
-        .split_whitespace()
-        .map(|x| x.parse::<i64>().unwrap())
-        .collect();
-    buf.clear();
-
-    let mut tree: SegTree<_, Plus> =
-        SegTree::build(len as usize, |i| (Sum(init[i]), Size::default()));
-
-    for _i in 0..num_commands {
-        stdin().read_line(&mut buf).unwrap();
-        match buf
-            .split_whitespace()
-            .map(|x| x.parse::<i64>().unwrap())
-            .collect::<Vec<_>>()[..]
-        {
-            [1, x, y, k] => tree = tree.apply((x - 1) as usize..y as usize, Plus(k)),
-            [2, x, y] => println!("{}", tree.query((x - 1) as usize..y as usize).0 .0),
+    for _ in 0..num_commands {
+        let op: u8 = input.next();
+        let x: usize = input.next();
+        let y: usize = input.next();
+        match op {
+            1 => {
+                let k: i64 = input.next();
+                tree = tree.apply(x - 1..y, Plus(k));
+            }
+            2 => println!("{}", tree.query(x - 1..y).0 .0),
             _ => unreachable!(),
         }
-        buf.clear();
     }
 }

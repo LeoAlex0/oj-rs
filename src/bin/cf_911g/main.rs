@@ -1,6 +1,4 @@
-extern crate solution;
-
-use std::io::BufRead;
+use solution::io::{Output, Scanner};
 
 #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"),))]
 #[target_feature(enable = "avx2")]
@@ -35,41 +33,27 @@ unsafe fn update(arr: &mut Vec<u8>, l: usize, r: usize, x: u8, y: u8) {
 }
 
 fn main() {
-    let mut lines = std::io::stdin().lock().lines();
+    let mut input = Scanner::stdin();
 
-    let n: usize = lines.next().unwrap().unwrap().trim().parse().unwrap();
+    let n: usize = input.next();
 
-    let mut array: Vec<u8> = lines
-        .next()
-        .unwrap()
-        .unwrap()
-        .split_whitespace()
-        .map(|word| word.parse().unwrap())
-        .collect();
+    let mut array: Vec<u8> = (0..n).map(|_| input.next()).collect();
 
-    let _q: usize = lines.next().unwrap().unwrap().trim().parse().unwrap();
-    // let mut i: usize = 0;
-    while let Some(Ok(line)) = lines.next() {
-        if let [l, r, x, y] = line
-            .split_whitespace()
-            .take(4)
-            .map(|word| word.parse::<usize>().unwrap())
-            .collect::<Vec<_>>()[..]
-        {
-            unsafe { update(&mut array, l, r, x as u8, y as u8) }
-        }
-
-        // i += 1;
-        // if i % 1000 == 0 {
-        //     println!("command {i} / {q} done");
-        // }
+    let q: usize = input.next();
+    for _ in 0..q {
+        let l: usize = input.next();
+        let r: usize = input.next();
+        let x: u8 = input.next();
+        let y: u8 = input.next();
+        unsafe { update(&mut array, l, r, x, y) }
     }
 
-    let ans = array
-        .iter()
-        .map(|i| i.to_string())
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    println!("{ans}")
+    let mut output = Output::stdout();
+    for (i, value) in array.iter().enumerate() {
+        if i > 0 {
+            output.print(" ");
+        }
+        output.print(value);
+    }
+    output.println("");
 }

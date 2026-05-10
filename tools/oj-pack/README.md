@@ -55,6 +55,8 @@ cargo test -p oj-pack
 - `Library::eliminate_dead_items`：item-level DCE。它从根 item 出发，反复扩展
   本地引用、相关 impl block 和必要宏调用，直到可达集合稳定。
 - `Library::render`：按原模块树顺序输出仍然可达的模块和 item。
+  re-export-only 模块如果会被 binary 的 `use` 语句引用，也会保留对应
+  `pub use`，例如 `traits::prelude`。
 - `RewriteCrateName`：把 binary 里的 `solution::...` 改为单文件内的
   `crate::...`。
 - `minify`：只在 `--minify` 时使用，按 token 判断是否必须保留空格。
@@ -92,7 +94,8 @@ DCE 是保守的近似名称解析，不是完整 Rust resolver。
 - `src/lib.rs` 作为 library root；
 - `mod foo;` 对应 `foo.rs` 或 `foo/mod.rs`；
 - inline module；
-- `pub use module::*` 这类 re-export。
+- `pub use module::*` 这类 re-export；
+- re-export 路径中的 `self`、`super` 和 `crate` 前缀。
 
 当前不支持：
 

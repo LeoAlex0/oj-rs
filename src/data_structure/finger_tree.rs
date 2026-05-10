@@ -1,5 +1,9 @@
 use crate::traits::{monoid::Monoid, monoid::Size, semigroup::Semigroup};
 
+pub mod prelude {
+    pub use super::{FingerTree, Measured, PersistMonoidIndexDeque, Value};
+}
+
 // Traits
 
 pub trait Measured: Clone {

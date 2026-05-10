@@ -4,6 +4,21 @@
 binary 放在 `src/bin/<problem>/main.rs` 下，复用的数据结构和算法放在
 `src/` 下的 `solution` library crate 中。
 
+## 题解代码组织
+
+题解推荐只导入自己需要的主题级入口，避免把整个 library 都带进打包根集合：
+
+```rust
+use solution::data_structure::seg_tree::prelude::*;
+use solution::io::{Output, Scanner};
+use solution::traits::prelude::*;
+```
+
+`solution::io` 提供轻量的 `Scanner` 和 `Output`，用于 OJ 常见的
+whitespace token 输入和缓冲输出。数据结构模块按需提供自己的 `prelude`，
+例如 `seg_tree::prelude`、`finger_tree::prelude`；代数抽象放在
+`traits::prelude`。
+
 ## 打包提交
 
 多数 OJ 只能提交单个源文件。本仓库提供了 `oj-pack`，用于把某个 Cargo

@@ -1,9 +1,6 @@
-extern crate solution;
-
-use solution::data_structure::seg_tree::*;
-use solution::traits::monoid::Monoid;
-use solution::traits::semigroup::Semigroup;
-use std::io::{stdin, BufRead};
+use solution::data_structure::seg_tree::prelude::*;
+use solution::io::Scanner;
+use solution::traits::prelude::{Monoid, Semigroup};
 
 static mut P: u32 = 0;
 
@@ -73,55 +70,37 @@ impl Applier<(Sum, Size)> for Linear {
 }
 
 fn main() {
-    let mut buf = String::new();
-    let stdin = stdin();
-    let mut stdin = stdin.lock();
-    stdin.read_line(&mut buf).unwrap();
-
-    let (len, num_commands, mod_by) = match buf
-        .split_whitespace()
-        .map(|s| s.parse::<u32>().unwrap())
-        .collect::<Vec<_>>()[..]
-    {
-        [len, num_commands, mod_by, ..] => (len, num_commands, mod_by),
-        _ => unreachable!(),
-    };
-    buf.clear();
+    let mut input = Scanner::stdin();
+    let len: usize = input.next();
+    let num_commands: usize = input.next();
+    let mod_by: u32 = input.next();
 
     // Safe because the tree haven't create yet.
     unsafe {
         P = mod_by;
     }
 
-    stdin.read_line(&mut buf).unwrap();
-    let init_value = buf
-        .split_whitespace()
-        .map(|s| s.parse::<u32>().unwrap())
-        .collect::<Vec<_>>();
-    buf.clear();
+    let init_value: Vec<u32> = (0..len).map(|_| input.next()).collect();
 
-    let mut tree: SegTree<_, Linear> =
-        SegTree::build(len as usize, |i| (Sum(init_value[i]), Size(1)));
+    let mut tree: SegTree<_, Linear> = SegTree::build(len, |i| (Sum(init_value[i]), Size(1)));
 
     for _ in 0..num_commands {
-        stdin.read_line(&mut buf).unwrap();
-        let op = buf
-            .split_whitespace()
-            .map(|s| s.parse::<u32>().unwrap())
-            .collect::<Vec<_>>();
-        buf.clear();
-
-        match op[..] {
-            [1, x, y, k] => {
+        let op: u8 = input.next();
+        let x: usize = input.next();
+        let y: usize = input.next();
+        match op {
+            1 => {
+                let k: u32 = input.next();
                 // a[x..y] = k * a[x..y] + 0
-                tree = tree.apply(x as usize - 1..y as usize, Linear { k, b: 0 });
+                tree = tree.apply(x - 1..y, Linear { k, b: 0 });
             }
-            [2, x, y, b] => {
+            2 => {
+                let b: u32 = input.next();
                 // a[x..y] = 1 * a[x..y] + b
-                tree = tree.apply(x as usize - 1..y as usize, Linear { k: 1, b });
+                tree = tree.apply(x - 1..y, Linear { k: 1, b });
             }
-            [3, x, y] => {
-                println!("{}", tree.query(x as usize - 1..y as usize).0 .0);
+            3 => {
+                println!("{}", tree.query(x - 1..y).0 .0);
             }
             _ => unreachable!(),
         }

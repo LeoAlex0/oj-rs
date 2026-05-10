@@ -1,3 +1,7 @@
 pub mod persist;
 
-pub use persist::*;
+pub mod prelude {
+    pub use super::persist::*;
+}
+
+pub use prelude::*;
