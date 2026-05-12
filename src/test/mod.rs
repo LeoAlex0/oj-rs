@@ -1,1 +1,1 @@
-pub mod fingertree;
+pub mod finger_tree;

@@ -7,8 +7,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use cargo_metadata::MetadataCommand;
 use proc_macro2::{Delimiter, Ident, TokenStream, TokenTree};
 use quote::{quote, ToTokens};
+use syn::punctuated::Punctuated;
 use syn::visit_mut::{self, VisitMut};
-use syn::{Attribute, File, Item, ItemMacro, ItemUse, Type, UseTree};
+use syn::{Attribute, File, Item, ItemMacro, ItemUse, Token, Type, UseTree};
 
 type BoxError = Box<dyn std::error::Error>;
 type ItemKey = usize;
@@ -680,6 +681,11 @@ impl Library {
         let module_has_code = self.module_contains_output(module, kept, kept_names);
         for item in &module.items {
             match item {
+                ModuleItem::Use(item) if module_has_code && is_pub_use(item) => {
+                    if let Some(item) = self.prune_reexport_use(item, &module.path, kept) {
+                        out.push(Item::Use(item));
+                    }
+                }
                 ModuleItem::Use(item) if module_has_code => out.push(Item::Use(item.clone())),
                 ModuleItem::Use(_) => {}
                 ModuleItem::Item(key) if kept.contains(key) => {
@@ -708,6 +714,63 @@ impl Library {
             return Ok(Vec::new());
         }
         Ok(out)
+    }
+
+    fn prune_reexport_use(
+        &self,
+        item: &ItemUse,
+        module_path: &[String],
+        kept: &BTreeSet<ItemKey>,
+    ) -> Option<ItemUse> {
+        let mut item = item.clone();
+        item.tree = self.prune_reexport_tree(&item.tree, module_path, kept)?;
+        Some(item)
+    }
+
+    fn prune_reexport_tree(
+        &self,
+        tree: &UseTree,
+        module_path: &[String],
+        kept: &BTreeSet<ItemKey>,
+    ) -> Option<UseTree> {
+        match tree {
+            UseTree::Path(path) => {
+                let child_path = resolve_use_path_segment(module_path, &path.ident);
+                let mut path = path.clone();
+                path.tree = Box::new(self.prune_reexport_tree(&path.tree, &child_path, kept)?);
+                Some(UseTree::Path(path))
+            }
+            UseTree::Name(name) => self
+                .exported_matching(module_path, Some(&name.ident.to_string()))
+                .into_iter()
+                .any(|key| kept.contains(&key))
+                .then(|| tree.clone()),
+            UseTree::Rename(rename) => self
+                .exported_matching(module_path, Some(&rename.ident.to_string()))
+                .into_iter()
+                .any(|key| kept.contains(&key))
+                .then(|| tree.clone()),
+            UseTree::Glob(_) => self
+                .exported_matching(module_path, None)
+                .into_iter()
+                .any(|key| kept.contains(&key))
+                .then(|| tree.clone()),
+            UseTree::Group(group) => {
+                let mut items = Punctuated::<UseTree, Token![,]>::new();
+                for item in &group.items {
+                    if let Some(item) = self.prune_reexport_tree(item, module_path, kept) {
+                        items.push(item);
+                    }
+                }
+                if items.is_empty() {
+                    None
+                } else {
+                    let mut group = group.clone();
+                    group.items = items;
+                    Some(UseTree::Group(group))
+                }
+            }
+        }
     }
 
     fn module_contains_output(
@@ -1446,6 +1509,26 @@ mod tests {
         .expect_err("too-small max-bytes should fail");
 
         assert!(err.to_string().contains("exceeding --max-bytes 10"));
+    }
+
+    #[test]
+    fn prunes_prelude_reexports_after_dce() {
+        let output = pack_project(
+            repo_root(),
+            "luogu_p1383",
+            PackOptions {
+                check: true,
+                minify: false,
+                max_bytes: None,
+                warn_bytes: usize::MAX,
+            },
+        )
+        .expect("pack luogu_p1383");
+
+        assert!(output.contains("pub mod finger_tree"));
+        assert!(output.contains("ArenaFingerTree"));
+        assert!(!output.contains("BoxFingerTree"));
+        assert!(!output.contains("BoxFamily"));
     }
 
     #[test]
