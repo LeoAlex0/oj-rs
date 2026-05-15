@@ -610,10 +610,10 @@ impl Library {
                 ModuleItem::Use(item) if is_pub_use(item) => {
                     collect_reexport_roots(&item.tree, &module.path, name, self, out);
                 }
-                ModuleItem::Child(child) => {
-                    if name.is_some_and(|name| child.name.as_deref() == Some(name)) {
-                        self.collect_exports(child, None, out);
-                    }
+                ModuleItem::Child(child)
+                    if name.is_some_and(|name| child.name.as_deref() == Some(name)) =>
+                {
+                    self.collect_exports(child, None, out);
                 }
                 _ => {}
             }
@@ -638,14 +638,13 @@ impl Library {
                 ModuleItem::Use(item) if is_pub_use(item) => {
                     collect_reexport_glob_roots(&item.tree, &module.path, used_names, self, out);
                 }
-                ModuleItem::Child(child) => {
+                ModuleItem::Child(child)
                     if child
                         .name
                         .as_ref()
-                        .is_some_and(|name| used_names.contains(name))
-                    {
-                        self.collect_glob_exports(child, used_names, out);
-                    }
+                        .is_some_and(|name| used_names.contains(name)) =>
+                {
+                    self.collect_glob_exports(child, used_names, out);
                 }
                 _ => {}
             }
@@ -1096,13 +1095,11 @@ fn local_self_type_idents(ty: &Type) -> BTreeSet<String> {
 
 fn collect_self_type_idents(ty: &Type, names: &mut BTreeSet<String>) {
     match ty {
-        Type::Path(ty) => {
-            if ty.qself.is_none() {
-                if let Some(segment) = ty.path.segments.last() {
-                    let name = segment.ident.to_string();
-                    if !is_builtin_type_name(&name) {
-                        names.insert(name);
-                    }
+        Type::Path(ty) if ty.qself.is_none() => {
+            if let Some(segment) = ty.path.segments.last() {
+                let name = segment.ident.to_string();
+                if !is_builtin_type_name(&name) {
+                    names.insert(name);
                 }
             }
         }
@@ -1242,11 +1239,9 @@ fn collect_reexport_glob_roots(
                 }
             }
         }
-        UseTree::Rename(item) => {
-            if used_names.contains(&item.rename.to_string()) {
-                for key in library.exported_matching(module_path, Some(&item.ident.to_string())) {
-                    out.push(key);
-                }
+        UseTree::Rename(item) if used_names.contains(&item.rename.to_string()) => {
+            for key in library.exported_matching(module_path, Some(&item.ident.to_string())) {
+                out.push(key);
             }
         }
         UseTree::Group(group) => {

@@ -27,10 +27,12 @@
               cargo
               rustc
               rustfmt
-              pre-commit
+              rust-analyzer
               rustPackages.clippy
+              pre-commit
               gnuplot
-              linuxPackages.perf
+              perf
+              gh
             ];
             RUST_SRC_PATH = rustPlatform.rustLibSrc;
           };
