@@ -1,12 +1,12 @@
-use std::{cell::RefCell, rc::Rc};
-
+use crate::data_structure::ref_store::{
+    ArcStoreFactory, ArenaStoreFactory, ConstArenaStoreFactory, LayeredArenaStoreFactory,
+    LayeredRef, RcStoreFactory, RefMapper, RefStore, RefStoreFactory,
+};
 use crate::traits::{monoid::Monoid, monoid::Size, semigroup::Semigroup};
+use std::marker::PhantomData;
 
 pub mod prelude {
-    pub use super::{
-        ArenaFamily, ArenaFingerTree, BoxFamily, BoxFingerTree, FingerTree, HeapRefKind, Measured,
-        RcFamily, RefFamily, Value,
-    };
+    pub use super::{FingerTree, FingerTreeStore, Measured, Value};
 }
 
 pub trait Measured: Clone {
@@ -25,226 +25,526 @@ impl<T: Clone> Measured for Value<T> {
     }
 }
 
-pub trait RefFamily<A: Measured>: Clone + Sized {
-    type NodeRef: Clone;
-    type TreeRef: Clone;
+pub trait FingerTreeRefs<A: Measured>:
+    Sized + RefStore<Node<A, Self>> + RefStore<Tree<A, Self>>
+{
+    fn alloc_node(&mut self, node: Node<A, Self>) -> NodeRef<A, Self> {
+        <Self as RefStore<Node<A, Self>>>::alloc(self, node)
+    }
 
-    fn alloc_node(&self, node: Node<A, Self>) -> Self::NodeRef;
-    fn alloc_tree(&self, tree: Tree<A, Self>) -> Self::TreeRef;
+    fn alloc_tree(&mut self, tree: Tree<A, Self>) -> TreeRef<A, Self> {
+        <Self as RefStore<Tree<A, Self>>>::alloc(self, tree)
+    }
 
-    fn with_node<T, F>(&self, node: &Self::NodeRef, f: F) -> T
+    fn with_node<T, F>(&self, node: &NodeRef<A, Self>, f: F) -> T
     where
-        F: FnOnce(&Node<A, Self>) -> T;
+        F: FnOnce(&Node<A, Self>) -> T,
+    {
+        <Self as RefStore<Node<A, Self>>>::with_ref(self, node, f)
+    }
 
-    fn with_tree<T, F>(&self, tree: &Self::TreeRef, f: F) -> T
+    fn with_tree<T, F>(&self, tree: &TreeRef<A, Self>, f: F) -> T
     where
-        F: FnOnce(&Tree<A, Self>) -> T;
+        F: FnOnce(&Tree<A, Self>) -> T,
+    {
+        <Self as RefStore<Tree<A, Self>>>::with_ref(self, tree, f)
+    }
 
-    fn into_node(&self, node: Self::NodeRef) -> Node<A, Self>;
-    fn into_tree(&self, tree: Self::TreeRef) -> Tree<A, Self>;
+    fn measure_node_ref(&self, node: &NodeRef<A, Self>) -> A::Measure {
+        self.with_node(node, |node| node.measure())
+    }
 
-    // 判断 `self` 分配出来的引用能否被 `other` 解释，反过来也一样。
-    //
-    // 这不是值相等，而是分配来源检查。concat 会把两边的节点接进同一棵
-    // 结果树里，所以必须确认两边的引用句柄属于同一个可解释区域。
-    // Rc/Box 这类堆引用自己携带目标地址，同一种 family 的任意值都兼容。
-    // ArenaFamily 只保存数字下标，因此只有指向同一个底层存储时才能拼接。
-    fn same_region(&self, _other: &Self) -> bool {
-        true
+    fn measure_tree_ref(&self, tree: &TreeRef<A, Self>) -> A::Measure {
+        self.with_tree(tree, |tree| tree.measure())
+    }
+
+    fn clone_tree_ref(&self, tree: &TreeRef<A, Self>) -> Tree<A, Self> {
+        self.with_tree(tree, Clone::clone)
+    }
+
+    fn leaf_value(&self, node: &NodeRef<A, Self>) -> A {
+        self.with_node(node, |node| match &node.inner {
+            NodeInner::Leaf(value) => value.clone(),
+            NodeInner::Branch2 { .. } | NodeInner::Branch3 { .. } => {
+                // 对外的 view/split 只会在根层调用；论文里这一层的逻辑元素
+                // 类型是 `A`。
+                unreachable!("top-level tree operation returned an internal branch")
+            }
+        })
+    }
+
+    fn node_to_digit(&self, node: &NodeRef<A, Self>) -> Digit<NodeRef<A, Self>> {
+        self.with_node(node, |node| match &node.inner {
+            NodeInner::Branch2 { left, right } => Digit::Two([left.clone(), right.clone()]),
+            NodeInner::Branch3 {
+                left,
+                middle,
+                right,
+            } => Digit::Three([left.clone(), middle.clone(), right.clone()]),
+            // 只有来自中间树的递归结果会被展开成 Digit。论文里这些树的元素类型是
+            // `Node v a`，不可能是 `a`。
+            NodeInner::Leaf(_) => unreachable!("leaf node cannot be unlifted"),
+        })
     }
 }
 
-#[derive(Clone, Copy, Default)]
-pub struct RcFamily;
+type FingerStoreNode<A, F> = Node<A, FingerTreeStore<A, F>>;
+type FingerStoreTree<A, F> = Tree<A, FingerTreeStore<A, F>>;
+type FingerNodeStore<A, F> = <F as RefStoreFactory>::Store<FingerStoreNode<A, F>>;
+type FingerTreeStoreInner<A, F> = <F as RefStoreFactory>::Store<FingerStoreTree<A, F>>;
+type BaseArenaFingerTreeStore<'base, A> = FingerTreeStore<A, ArenaStoreFactory<'base>>;
 
-#[derive(Clone, Copy, Default)]
-pub struct BoxFamily;
+pub type LayeredArenaFingerTreeStore<'store, 'base, 'scratch, A> = FingerTreeStore<
+    A,
+    LayeredArenaStoreFactory<
+        'store,
+        'scratch,
+        BaseArenaFingerTreeStore<'base, A>,
+        FingerTreeLayerMapper<'store, 'base, 'scratch, A>,
+    >,
+>;
 
-pub trait HeapRefKind: Clone + Copy + Default {
-    type Ref<T: Clone>: Clone + AsRef<T>;
+type FingerTreeLayerMarker<'store, 'base, 'scratch, A> =
+    PhantomData<fn() -> (&'store (), &'base (), &'scratch (), A)>;
 
-    fn new_ref<T: Clone>(value: T) -> Self::Ref<T>;
-    fn into_owned<T: Clone>(value: Self::Ref<T>) -> T;
+#[doc(hidden)]
+pub struct FingerTreeLayerMapper<'store, 'base, 'scratch, A: Measured>(
+    FingerTreeLayerMarker<'store, 'base, 'scratch, A>,
+);
+
+pub trait FingerTreeStoreFactory<A: Measured>: RefStoreFactory + Sized {
+    #[inline]
+    fn measure_node_ref(
+        store: &FingerTreeStore<A, Self>,
+        node: &NodeRef<A, FingerTreeStore<A, Self>>,
+    ) -> A::Measure
+    where
+        FingerNodeStore<A, Self>: RefStore<FingerStoreNode<A, Self>>,
+        FingerTreeStoreInner<A, Self>: RefStore<FingerStoreTree<A, Self>>,
+        FingerTreeStore<A, Self>: RefStore<Node<A, FingerTreeStore<A, Self>>>,
+    {
+        <FingerTreeStore<A, Self> as RefStore<Node<A, FingerTreeStore<A, Self>>>>::with_ref(
+            store,
+            node,
+            |node| node.measure(),
+        )
+    }
+
+    #[inline]
+    fn measure_tree_ref(
+        store: &FingerTreeStore<A, Self>,
+        tree: &TreeRef<A, FingerTreeStore<A, Self>>,
+    ) -> A::Measure
+    where
+        FingerNodeStore<A, Self>: RefStore<FingerStoreNode<A, Self>>,
+        FingerTreeStoreInner<A, Self>: RefStore<FingerStoreTree<A, Self>>,
+        FingerTreeStore<A, Self>: RefStore<Tree<A, FingerTreeStore<A, Self>>>,
+    {
+        <FingerTreeStore<A, Self> as RefStore<Tree<A, FingerTreeStore<A, Self>>>>::with_ref(
+            store,
+            tree,
+            |tree| tree.measure(),
+        )
+    }
+
+    #[inline]
+    fn clone_tree_ref(
+        store: &FingerTreeStore<A, Self>,
+        tree: &TreeRef<A, FingerTreeStore<A, Self>>,
+    ) -> Tree<A, FingerTreeStore<A, Self>>
+    where
+        FingerNodeStore<A, Self>: RefStore<FingerStoreNode<A, Self>>,
+        FingerTreeStoreInner<A, Self>: RefStore<FingerStoreTree<A, Self>>,
+        FingerTreeStore<A, Self>: RefStore<Tree<A, FingerTreeStore<A, Self>>>,
+    {
+        <FingerTreeStore<A, Self> as RefStore<Tree<A, FingerTreeStore<A, Self>>>>::with_ref(
+            store,
+            tree,
+            Clone::clone,
+        )
+    }
+
+    #[inline]
+    fn leaf_value(
+        store: &FingerTreeStore<A, Self>,
+        node: &NodeRef<A, FingerTreeStore<A, Self>>,
+    ) -> A
+    where
+        FingerNodeStore<A, Self>: RefStore<FingerStoreNode<A, Self>>,
+        FingerTreeStoreInner<A, Self>: RefStore<FingerStoreTree<A, Self>>,
+        FingerTreeStore<A, Self>: RefStore<Node<A, FingerTreeStore<A, Self>>>,
+    {
+        <FingerTreeStore<A, Self> as RefStore<Node<A, FingerTreeStore<A, Self>>>>::with_ref(
+            store,
+            node,
+            |node| match &node.inner {
+                NodeInner::Leaf(value) => value.clone(),
+                NodeInner::Branch2 { .. } | NodeInner::Branch3 { .. } => {
+                    unreachable!("top-level tree operation returned an internal branch")
+                }
+            },
+        )
+    }
+
+    #[inline]
+    fn node_to_digit(
+        store: &FingerTreeStore<A, Self>,
+        node: &NodeRef<A, FingerTreeStore<A, Self>>,
+    ) -> Digit<NodeRef<A, FingerTreeStore<A, Self>>>
+    where
+        FingerNodeStore<A, Self>: RefStore<FingerStoreNode<A, Self>>,
+        FingerTreeStoreInner<A, Self>: RefStore<FingerStoreTree<A, Self>>,
+        FingerTreeStore<A, Self>: RefStore<Node<A, FingerTreeStore<A, Self>>>,
+    {
+        <FingerTreeStore<A, Self> as RefStore<Node<A, FingerTreeStore<A, Self>>>>::with_ref(
+            store,
+            node,
+            |node| match &node.inner {
+                NodeInner::Branch2 { left, right } => Digit::Two([left.clone(), right.clone()]),
+                NodeInner::Branch3 {
+                    left,
+                    middle,
+                    right,
+                } => Digit::Three([left.clone(), middle.clone(), right.clone()]),
+                NodeInner::Leaf(_) => unreachable!("leaf node cannot be unlifted"),
+            },
+        )
+    }
 }
 
-impl HeapRefKind for RcFamily {
-    type Ref<T: Clone> = Rc<T>;
-
-    fn new_ref<T: Clone>(value: T) -> Self::Ref<T> {
-        Rc::new(value)
-    }
-
-    fn into_owned<T: Clone>(value: Self::Ref<T>) -> T {
-        match Rc::try_unwrap(value) {
-            Ok(value) => value,
-            Err(value) => value.as_ref().clone(),
-        }
-    }
+impl<A: Measured> FingerTreeStoreFactory<A> for RcStoreFactory {}
+impl<A: Measured> FingerTreeStoreFactory<A> for ArcStoreFactory {}
+impl<'id, A: Measured> FingerTreeStoreFactory<A> for ArenaStoreFactory<'id> {}
+impl<'id, const N: usize, A: Measured> FingerTreeStoreFactory<A>
+    for ConstArenaStoreFactory<'id, N>
+{
 }
 
-impl HeapRefKind for BoxFamily {
-    type Ref<T: Clone> = Box<T>;
-
-    fn new_ref<T: Clone>(value: T) -> Self::Ref<T> {
-        Box::new(value)
-    }
-
-    fn into_owned<T: Clone>(value: Self::Ref<T>) -> T {
-        *value
-    }
+pub struct FingerTreeStore<A: Measured, F: FingerTreeStoreFactory<A> = RcStoreFactory>
+where
+    FingerNodeStore<A, F>: RefStore<FingerStoreNode<A, F>>,
+    FingerTreeStoreInner<A, F>: RefStore<FingerStoreTree<A, F>>,
+{
+    nodes: FingerNodeStore<A, F>,
+    trees: FingerTreeStoreInner<A, F>,
 }
 
-impl<A, R> RefFamily<A> for R
+// `ArenaRef` 本身只是 arena 内的下标，所以普通 arena store 要求树和 store
+// 来自同一个 region：否则同一个下标可能被拿去读另一块 arena。
+//
+// layered store 显式记录引用来源，读旧节点时走 base arena，分配新节点时走
+// scratch arena。它的返回树带有 `'scratch`，因此类型系统会保证这些新引用先于
+// 外层 base 释放；同时 `LayeredRef` 的 Base/Scratch 分支避免了下标串门。
+
+impl<A, F> FingerTreeStore<A, F>
 where
     A: Measured,
-    R: HeapRefKind,
+    F: FingerTreeStoreFactory<A>,
+    FingerNodeStore<A, F>: RefStore<FingerStoreNode<A, F>>,
+    FingerTreeStoreInner<A, F>: RefStore<FingerStoreTree<A, F>>,
 {
-    type NodeRef = R::Ref<Node<A, R>>;
-    type TreeRef = R::Ref<Tree<A, R>>;
-
-    fn alloc_node(&self, node: Node<A, Self>) -> Self::NodeRef {
-        R::new_ref(node)
-    }
-
-    fn alloc_tree(&self, tree: Tree<A, Self>) -> Self::TreeRef {
-        R::new_ref(tree)
-    }
-
-    fn with_node<T, F>(&self, node: &Self::NodeRef, f: F) -> T
-    where
-        F: FnOnce(&Node<A, Self>) -> T,
-    {
-        f(node.as_ref())
-    }
-
-    fn with_tree<T, F>(&self, tree: &Self::TreeRef, f: F) -> T
-    where
-        F: FnOnce(&Tree<A, Self>) -> T,
-    {
-        f(tree.as_ref())
-    }
-
-    fn into_node(&self, node: Self::NodeRef) -> Node<A, Self> {
-        R::into_owned(node)
-    }
-
-    fn into_tree(&self, tree: Self::TreeRef) -> Tree<A, Self> {
-        R::into_owned(tree)
-    }
-}
-
-pub type BoxFingerTree<A> = FingerTree<A, BoxFamily>;
-pub type ArenaFingerTree<A> = FingerTree<A, ArenaFamily<A>>;
-
-pub struct ArenaFamily<A: Measured> {
-    storage: Rc<RefCell<ArenaStorage<A>>>,
-}
-
-struct ArenaStorage<A: Measured> {
-    nodes: Vec<Node<A, ArenaFamily<A>>>,
-    trees: Vec<Tree<A, ArenaFamily<A>>>,
-}
-
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct ArenaNodeRef {
-    index: usize,
-}
-
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct ArenaTreeRef {
-    index: usize,
-}
-
-impl<A: Measured> Clone for ArenaFamily<A> {
-    fn clone(&self) -> Self {
+    #[inline]
+    pub fn new(factory: F) -> Self {
         Self {
-            storage: self.storage.clone(),
+            nodes: factory.store(),
+            trees: factory.store(),
         }
     }
 }
 
-impl<A: Measured> ArenaFamily<A> {
-    pub fn new() -> Self {
-        Self::with_capacity(0)
-    }
-    pub fn with_capacity(capacity: usize) -> Self {
-        Self {
-            storage: Rc::new(RefCell::new(ArenaStorage {
-                nodes: Vec::with_capacity(capacity),
-                trees: Vec::with_capacity(capacity / 4 + 1),
-            })),
-        }
-    }
-}
-
-impl<A: Measured> Default for ArenaFamily<A> {
+impl<A, F> Default for FingerTreeStore<A, F>
+where
+    A: Measured,
+    F: FingerTreeStoreFactory<A> + Default,
+    FingerNodeStore<A, F>: RefStore<FingerStoreNode<A, F>>,
+    FingerTreeStoreInner<A, F>: RefStore<FingerStoreTree<A, F>>,
+{
     fn default() -> Self {
-        Self::new()
+        Self::new(F::default())
     }
 }
 
-impl<A: Measured> RefFamily<A> for ArenaFamily<A> {
-    type NodeRef = ArenaNodeRef;
-    type TreeRef = ArenaTreeRef;
-
-    fn alloc_node(&self, node: Node<A, Self>) -> Self::NodeRef {
-        let mut storage = self.storage.borrow_mut();
-        let index = storage.nodes.len();
-        storage.nodes.push(node);
-        ArenaNodeRef { index }
-    }
-
-    fn alloc_tree(&self, tree: Tree<A, Self>) -> Self::TreeRef {
-        let mut storage = self.storage.borrow_mut();
-        let index = storage.trees.len();
-        storage.trees.push(tree);
-        ArenaTreeRef { index }
-    }
-
-    fn with_node<T, F>(&self, node: &Self::NodeRef, f: F) -> T
+impl<'base, A: Measured> FingerTreeStore<A, ArenaStoreFactory<'base>> {
+    #[inline]
+    pub fn layered<'store, T, F>(&'store self, capacity: usize, f: F) -> T
     where
-        F: FnOnce(&Node<A, Self>) -> T,
+        F: for<'scratch> FnOnce(LayeredArenaFingerTreeStore<'store, 'base, 'scratch, A>) -> T,
     {
-        let storage = self.storage.borrow();
-        f(&storage.nodes[node.index])
-    }
-    fn into_node(&self, node: Self::NodeRef) -> Node<A, Self> {
-        self.storage.borrow().nodes[node.index].clone()
-    }
-
-    fn with_tree<T, F>(&self, tree: &Self::TreeRef, f: F) -> T
-    where
-        F: FnOnce(&Tree<A, Self>) -> T,
-    {
-        let storage = self.storage.borrow();
-        f(&storage.trees[tree.index])
-    }
-
-    fn into_tree(&self, tree: Self::TreeRef) -> Tree<A, Self> {
-        self.storage.borrow().trees[tree.index].clone()
-    }
-
-    fn same_region(&self, other: &Self) -> bool {
-        // Arena 句柄只是下标；另一个 arena 里的同一个下标可能指向完全无关的
-        // 节点，所以来源兼容性就是共享存储的指针身份是否相同。
-        Rc::ptr_eq(&self.storage, &other.storage)
+        let factory = LayeredArenaStoreFactory::new(self, capacity);
+        f(FingerTreeStore {
+            nodes: factory.store_with_capacity(capacity),
+            trees: factory.store_with_capacity(capacity / 4 + 1),
+        })
     }
 }
 
-type NodeRef<A, R> = <R as RefFamily<A>>::NodeRef;
-type TreeRef<A, R> = <R as RefFamily<A>>::TreeRef;
+impl<'store, 'base, 'scratch, A: Measured> LayeredArenaFingerTreeStore<'store, 'base, 'scratch, A> {
+    #[inline]
+    pub fn from_base(
+        &self,
+        tree: &FingerTree<A, BaseArenaFingerTreeStore<'base, A>>,
+    ) -> FingerTree<A, Self> {
+        tree.map_refs(&|reference| LayeredRef::Base(*reference), &|reference| {
+            LayeredRef::Base(*reference)
+        })
+    }
 
-#[derive(Clone)]
-pub struct FingerTree<A: Measured, R: RefFamily<A> = RcFamily> {
+    #[inline]
+    fn map_base_node(
+        node: &Node<A, BaseArenaFingerTreeStore<'base, A>>,
+    ) -> Node<A, LayeredArenaFingerTreeStore<'store, 'base, 'scratch, A>> {
+        node.map_refs(&|reference| LayeredRef::Base(*reference))
+    }
+
+    #[inline]
+    fn map_base_tree(
+        tree: &Tree<A, BaseArenaFingerTreeStore<'base, A>>,
+    ) -> Tree<A, LayeredArenaFingerTreeStore<'store, 'base, 'scratch, A>> {
+        tree.map_refs(&|reference| LayeredRef::Base(*reference), &|reference| {
+            LayeredRef::Base(*reference)
+        })
+    }
+}
+
+impl<A, F> FingerTreeRefs<A> for FingerTreeStore<A, F>
+where
+    A: Measured,
+    F: FingerTreeStoreFactory<A>,
+    FingerNodeStore<A, F>: RefStore<FingerStoreNode<A, F>>,
+    FingerTreeStoreInner<A, F>: RefStore<FingerStoreTree<A, F>>,
+    Self: RefStore<Node<A, Self>> + RefStore<Tree<A, Self>>,
+{
+    #[inline]
+    fn measure_node_ref(&self, node: &NodeRef<A, Self>) -> A::Measure {
+        F::measure_node_ref(self, node)
+    }
+
+    #[inline]
+    fn measure_tree_ref(&self, tree: &TreeRef<A, Self>) -> A::Measure {
+        F::measure_tree_ref(self, tree)
+    }
+
+    #[inline]
+    fn clone_tree_ref(&self, tree: &TreeRef<A, Self>) -> Tree<A, Self> {
+        F::clone_tree_ref(self, tree)
+    }
+
+    #[inline]
+    fn leaf_value(&self, node: &NodeRef<A, Self>) -> A {
+        F::leaf_value(self, node)
+    }
+
+    #[inline]
+    fn node_to_digit(&self, node: &NodeRef<A, Self>) -> Digit<NodeRef<A, Self>> {
+        F::node_to_digit(self, node)
+    }
+}
+
+impl<'store, 'base, 'scratch, A: Measured>
+    RefMapper<Node<A, LayeredArenaFingerTreeStore<'store, 'base, 'scratch, A>>>
+    for FingerTreeLayerMapper<'store, 'base, 'scratch, A>
+{
+    type Source = Node<A, BaseArenaFingerTreeStore<'base, A>>;
+
+    fn map_ref(
+        value: &Self::Source,
+    ) -> Node<A, LayeredArenaFingerTreeStore<'store, 'base, 'scratch, A>> {
+        FingerTreeStore::map_base_node(value)
+    }
+}
+
+impl<'store, 'base, 'scratch, A: Measured>
+    RefMapper<Tree<A, LayeredArenaFingerTreeStore<'store, 'base, 'scratch, A>>>
+    for FingerTreeLayerMapper<'store, 'base, 'scratch, A>
+{
+    type Source = Tree<A, BaseArenaFingerTreeStore<'base, A>>;
+
+    fn map_ref(
+        value: &Self::Source,
+    ) -> Tree<A, LayeredArenaFingerTreeStore<'store, 'base, 'scratch, A>> {
+        FingerTreeStore::map_base_tree(value)
+    }
+}
+
+impl<'store, 'base, 'scratch, A: Measured> FingerTreeStoreFactory<A>
+    for LayeredArenaStoreFactory<
+        'store,
+        'scratch,
+        BaseArenaFingerTreeStore<'base, A>,
+        FingerTreeLayerMapper<'store, 'base, 'scratch, A>,
+    >
+{
+    #[inline]
+    fn measure_node_ref(
+        store: &LayeredArenaFingerTreeStore<'store, 'base, 'scratch, A>,
+        node: &NodeRef<A, LayeredArenaFingerTreeStore<'store, 'base, 'scratch, A>>,
+    ) -> A::Measure {
+        match node {
+            LayeredRef::Base(node) => store.nodes.with_base_ref(
+                node,
+                |node: &Node<A, BaseArenaFingerTreeStore<'base, A>>| node.measure(),
+            ),
+            LayeredRef::Scratch(node) => store.nodes.with_scratch_ref(node, |node| node.measure()),
+        }
+    }
+
+    #[inline]
+    fn measure_tree_ref(
+        store: &LayeredArenaFingerTreeStore<'store, 'base, 'scratch, A>,
+        tree: &TreeRef<A, LayeredArenaFingerTreeStore<'store, 'base, 'scratch, A>>,
+    ) -> A::Measure {
+        match tree {
+            LayeredRef::Base(tree) => store.trees.with_base_ref(
+                tree,
+                |tree: &Tree<A, BaseArenaFingerTreeStore<'base, A>>| tree.measure(),
+            ),
+            LayeredRef::Scratch(tree) => store.trees.with_scratch_ref(tree, |tree| tree.measure()),
+        }
+    }
+
+    #[inline]
+    fn clone_tree_ref(
+        store: &LayeredArenaFingerTreeStore<'store, 'base, 'scratch, A>,
+        tree: &TreeRef<A, LayeredArenaFingerTreeStore<'store, 'base, 'scratch, A>>,
+    ) -> Tree<A, LayeredArenaFingerTreeStore<'store, 'base, 'scratch, A>> {
+        match tree {
+            LayeredRef::Base(tree) => store
+                .trees
+                .with_base_ref(tree, FingerTreeStore::map_base_tree),
+            LayeredRef::Scratch(tree) => store.trees.with_scratch_ref(tree, Clone::clone),
+        }
+    }
+
+    #[inline]
+    fn leaf_value(
+        store: &LayeredArenaFingerTreeStore<'store, 'base, 'scratch, A>,
+        node: &NodeRef<A, LayeredArenaFingerTreeStore<'store, 'base, 'scratch, A>>,
+    ) -> A {
+        match node {
+            LayeredRef::Base(node) => store.nodes.with_base_ref(
+                node,
+                |node: &Node<A, BaseArenaFingerTreeStore<'base, A>>| match &node.inner {
+                    NodeInner::Leaf(value) => value.clone(),
+                    NodeInner::Branch2 { .. } | NodeInner::Branch3 { .. } => {
+                        unreachable!("top-level tree operation returned an internal branch")
+                    }
+                },
+            ),
+            LayeredRef::Scratch(node) => {
+                store
+                    .nodes
+                    .with_scratch_ref(node, |node| match &node.inner {
+                        NodeInner::Leaf(value) => value.clone(),
+                        NodeInner::Branch2 { .. } | NodeInner::Branch3 { .. } => {
+                            unreachable!("top-level tree operation returned an internal branch")
+                        }
+                    })
+            }
+        }
+    }
+
+    #[inline]
+    fn node_to_digit(
+        store: &LayeredArenaFingerTreeStore<'store, 'base, 'scratch, A>,
+        node: &NodeRef<A, LayeredArenaFingerTreeStore<'store, 'base, 'scratch, A>>,
+    ) -> Digit<NodeRef<A, LayeredArenaFingerTreeStore<'store, 'base, 'scratch, A>>> {
+        match node {
+            LayeredRef::Base(node) => store.nodes.with_base_ref(
+                node,
+                |node: &Node<A, BaseArenaFingerTreeStore<'base, A>>| match &node.inner {
+                    NodeInner::Branch2 { left, right } => {
+                        Digit::Two([LayeredRef::Base(*left), LayeredRef::Base(*right)])
+                    }
+                    NodeInner::Branch3 {
+                        left,
+                        middle,
+                        right,
+                    } => Digit::Three([
+                        LayeredRef::Base(*left),
+                        LayeredRef::Base(*middle),
+                        LayeredRef::Base(*right),
+                    ]),
+                    NodeInner::Leaf(_) => unreachable!("leaf node cannot be unlifted"),
+                },
+            ),
+            LayeredRef::Scratch(node) => {
+                store
+                    .nodes
+                    .with_scratch_ref(node, |node| match &node.inner {
+                        NodeInner::Branch2 { left, right } => Digit::Two([*left, *right]),
+                        NodeInner::Branch3 {
+                            left,
+                            middle,
+                            right,
+                        } => Digit::Three([*left, *middle, *right]),
+                        NodeInner::Leaf(_) => unreachable!("leaf node cannot be unlifted"),
+                    })
+            }
+        }
+    }
+}
+
+impl<A, F> RefStore<Node<A, FingerTreeStore<A, F>>> for FingerTreeStore<A, F>
+where
+    A: Measured,
+    F: FingerTreeStoreFactory<A>,
+    FingerNodeStore<A, F>: RefStore<Node<A, FingerTreeStore<A, F>>>,
+    FingerTreeStoreInner<A, F>: RefStore<Tree<A, FingerTreeStore<A, F>>>,
+{
+    type Ref = <FingerNodeStore<A, F> as RefStore<Node<A, FingerTreeStore<A, F>>>>::Ref;
+
+    #[inline]
+    fn alloc(&mut self, value: Node<A, FingerTreeStore<A, F>>) -> Self::Ref {
+        self.nodes.alloc(value)
+    }
+
+    #[inline]
+    fn with_ref<T, C>(&self, reference: &Self::Ref, f: C) -> T
+    where
+        C: FnOnce(&Node<A, FingerTreeStore<A, F>>) -> T,
+    {
+        self.nodes.with_ref(reference, f)
+    }
+}
+
+impl<A, F> RefStore<Tree<A, FingerTreeStore<A, F>>> for FingerTreeStore<A, F>
+where
+    A: Measured,
+    F: FingerTreeStoreFactory<A>,
+    FingerNodeStore<A, F>: RefStore<Node<A, FingerTreeStore<A, F>>>,
+    FingerTreeStoreInner<A, F>: RefStore<Tree<A, FingerTreeStore<A, F>>>,
+{
+    type Ref = <FingerTreeStoreInner<A, F> as RefStore<Tree<A, FingerTreeStore<A, F>>>>::Ref;
+
+    #[inline]
+    fn alloc(&mut self, value: Tree<A, FingerTreeStore<A, F>>) -> Self::Ref {
+        self.trees.alloc(value)
+    }
+
+    #[inline]
+    fn with_ref<T, C>(&self, reference: &Self::Ref, f: C) -> T
+    where
+        C: FnOnce(&Tree<A, FingerTreeStore<A, F>>) -> T,
+    {
+        self.trees.with_ref(reference, f)
+    }
+}
+
+type NodeRef<A, R> = <R as RefStore<Node<A, R>>>::Ref;
+type TreeRef<A, R> = <R as RefStore<Tree<A, R>>>::Ref;
+type DigitSplit<A, R> = (
+    Option<Digit<NodeRef<A, R>>>,
+    NodeRef<A, R>,
+    Option<Digit<NodeRef<A, R>>>,
+);
+
+pub struct FingerTree<A: Measured, R: FingerTreeRefs<A> = FingerTreeStore<A>> {
     root: Tree<A, R>,
-    refs: R,
 }
 
-#[derive(Clone)]
-pub struct Tree<A: Measured, R: RefFamily<A>>(TreeInner<A, R>);
+pub struct Tree<A: Measured, R: FingerTreeRefs<A>>(TreeInner<A, R>);
 
-#[derive(Clone)]
-enum TreeInner<A: Measured, R: RefFamily<A>> {
+enum TreeInner<A: Measured, R: FingerTreeRefs<A>> {
     Empty,
     Single {
         measure: A::Measure,
@@ -258,8 +558,7 @@ enum TreeInner<A: Measured, R: RefFamily<A>> {
     },
 }
 
-#[derive(Clone)]
-pub struct Node<A: Measured, R: RefFamily<A>> {
+pub struct Node<A: Measured, R: FingerTreeRefs<A>> {
     measure: A::Measure,
     inner: NodeInner<A, R>,
 }
@@ -282,8 +581,7 @@ pub struct Node<A: Measured, R: RefFamily<A>> {
 //
 // 本文件中的 `unreachable!` 都是在检查这些不变量是否被破坏。按论文的类型系统，
 // 这些分支静态上不可构造；在这个紧凑的单态表示里，它们标记了动态边界。
-#[derive(Clone)]
-enum NodeInner<A: Measured, R: RefFamily<A>> {
+enum NodeInner<A: Measured, R: FingerTreeRefs<A>> {
     Leaf(A),
     Branch2 {
         left: NodeRef<A, R>,
@@ -296,89 +594,150 @@ enum NodeInner<A: Measured, R: RefFamily<A>> {
     },
 }
 
+impl<A, R> Clone for FingerTree<A, R>
+where
+    A: Measured,
+    R: FingerTreeRefs<A>,
+{
+    fn clone(&self) -> Self {
+        Self {
+            root: self.root.clone(),
+        }
+    }
+}
+
+impl<A, R> Clone for Tree<A, R>
+where
+    A: Measured,
+    R: FingerTreeRefs<A>,
+{
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<A, R> Clone for TreeInner<A, R>
+where
+    A: Measured,
+    R: FingerTreeRefs<A>,
+{
+    fn clone(&self) -> Self {
+        match self {
+            Self::Empty => Self::Empty,
+            Self::Single { measure, node } => Self::Single {
+                measure: measure.clone(),
+                node: node.clone(),
+            },
+            Self::Deep {
+                measure,
+                prefix,
+                deeper,
+                suffix,
+            } => Self::Deep {
+                measure: measure.clone(),
+                prefix: prefix.clone(),
+                deeper: deeper.clone(),
+                suffix: suffix.clone(),
+            },
+        }
+    }
+}
+
+impl<A, R> Clone for Node<A, R>
+where
+    A: Measured,
+    R: FingerTreeRefs<A>,
+{
+    fn clone(&self) -> Self {
+        Self {
+            measure: self.measure.clone(),
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<A, R> Clone for NodeInner<A, R>
+where
+    A: Measured,
+    R: FingerTreeRefs<A>,
+{
+    fn clone(&self) -> Self {
+        match self {
+            Self::Leaf(value) => Self::Leaf(value.clone()),
+            Self::Branch2 { left, right } => Self::Branch2 {
+                left: left.clone(),
+                right: right.clone(),
+            },
+            Self::Branch3 {
+                left,
+                middle,
+                right,
+            } => Self::Branch3 {
+                left: left.clone(),
+                middle: middle.clone(),
+                right: right.clone(),
+            },
+        }
+    }
+}
+
+#[doc(hidden)]
 #[derive(Clone)]
-enum Digit<A> {
+pub enum Digit<A> {
     One([A; 1]),
     Two([A; 2]),
     Three([A; 3]),
     Four([A; 4]),
 }
 
-struct DigitIter<A>(Option<Digit<A>>);
+#[doc(hidden)]
+pub struct DigitIter<A>(Option<Digit<A>>);
 
-struct LiftNodeIter<A, R, I>
+struct NodeList<A: Measured, R: FingerTreeRefs<A>> {
+    items: [Option<NodeRef<A, R>>; 8],
+    len: usize,
+    measure: A::Measure,
+}
+
+struct NodeListIter<A: Measured, R: FingerTreeRefs<A>> {
+    items: [Option<NodeRef<A, R>>; 8],
+    front: usize,
+    back: usize,
+}
+
+struct LiftNodeIter<'a, A, R, I>
 where
     A: Measured,
-    R: RefFamily<A>,
+    R: FingerTreeRefs<A>,
     I: Iterator<Item = NodeRef<A, R>>,
 {
     buf: [Option<NodeRef<A, R>>; 5],
     live: u8,
     cursor: u8,
     iter: I,
-    refs: R,
-}
-
-struct OwnedPath;
-struct SharedPath;
-
-trait TreePath<A, R>
-where
-    A: Measured,
-    R: RefFamily<A>,
-{
-    fn tree_inner(tree: TreeRef<A, R>, refs: &R) -> TreeInner<A, R>;
-    fn node_digit(node: NodeRef<A, R>, refs: &R) -> Digit<NodeRef<A, R>>;
-}
-
-impl<A, R> TreePath<A, R> for OwnedPath
-where
-    A: Measured,
-    R: RefFamily<A>,
-{
-    fn tree_inner(tree: TreeRef<A, R>, refs: &R) -> TreeInner<A, R> {
-        refs.into_tree(tree).0
-    }
-
-    fn node_digit(node: NodeRef<A, R>, refs: &R) -> Digit<NodeRef<A, R>> {
-        Node::into_digit(node, refs)
-    }
-}
-
-impl<A, R> TreePath<A, R> for SharedPath
-where
-    A: Measured,
-    R: RefFamily<A>,
-{
-    fn tree_inner(tree: TreeRef<A, R>, refs: &R) -> TreeInner<A, R> {
-        Tree::clone_inner_from_ref(&tree, refs)
-    }
-
-    fn node_digit(node: NodeRef<A, R>, refs: &R) -> Digit<NodeRef<A, R>> {
-        Node::to_digit(&node, refs)
-    }
+    refs: &'a mut R,
 }
 
 impl<A, R> FingerTree<A, R>
 where
     A: Measured,
-    R: RefFamily<A> + Default,
+    R: FingerTreeRefs<A>,
 {
     pub fn new() -> Self {
-        Self::new_in(R::default())
-    }
-}
-
-impl<A, R> FingerTree<A, R>
-where
-    A: Measured,
-    R: RefFamily<A>,
-{
-    pub fn new_in(refs: R) -> Self {
         Self {
             root: Tree::empty(),
-            refs,
         }
+    }
+    pub fn from_iter_in<T>(refs: &mut R, iter: T) -> Self
+    where
+        T: IntoIterator<Item = A>,
+    {
+        let mut root = Tree::empty();
+        for value in iter {
+            let node = refs.alloc_node(Node::leaf(value));
+            root.push_back_mut(refs, node);
+        }
+        Self { root }
     }
     pub fn is_empty(&self) -> bool {
         matches!(self.root.0, TreeInner::Empty)
@@ -386,143 +745,116 @@ where
     pub fn measure(&self) -> A::Measure {
         self.root.measure()
     }
-    pub fn push_front(&self, value: A) -> Self {
-        self.clone().into_push_front(value)
+    pub fn front(&self, refs: &R) -> Option<A> {
+        self.root
+            .front_node()
+            .map(|node| Node::leaf_value(refs, &node))
     }
-    pub fn push_back(&self, value: A) -> Self {
-        self.clone().into_push_back(value)
+    pub fn back(&self, refs: &R) -> Option<A> {
+        self.root
+            .back_node()
+            .map(|node| Node::leaf_value(refs, &node))
     }
-    pub fn push_front_mut(&mut self, value: A) {
-        let old = self.take_root();
-        self.root = old.push_front(self.refs.alloc_node(Node::leaf(value)), &self.refs);
+    pub fn push_front(&self, refs: &mut R, value: A) -> Self {
+        self.clone().into_push_front(refs, value)
     }
-    pub fn push_back_mut(&mut self, value: A) {
-        let old = self.take_root();
-        self.root = old.push_back(self.refs.alloc_node(Node::leaf(value)), &self.refs);
+    pub fn push_back(&self, refs: &mut R, value: A) -> Self {
+        self.clone().into_push_back(refs, value)
     }
-    pub fn into_push_front(mut self, value: A) -> Self {
-        self.push_front_mut(value);
+    pub fn push_front_mut(&mut self, refs: &mut R, value: A) {
+        let node = refs.alloc_node(Node::leaf(value));
+        self.root.push_front_mut(refs, node);
+    }
+    pub fn push_back_mut(&mut self, refs: &mut R, value: A) {
+        let node = refs.alloc_node(Node::leaf(value));
+        self.root.push_back_mut(refs, node);
+    }
+    pub fn into_push_front(mut self, refs: &mut R, value: A) -> Self {
+        self.push_front_mut(refs, value);
         self
     }
-    pub fn into_push_back(mut self, value: A) -> Self {
-        self.push_back_mut(value);
+    pub fn into_push_back(mut self, refs: &mut R, value: A) -> Self {
+        self.push_back_mut(refs, value);
         self
     }
-    pub fn concat(&self, other: &Self) -> Self {
-        assert!(self.refs.same_region(&other.refs));
+    pub fn concat(&self, refs: &mut R, other: &Self) -> Self {
         Self {
-            root: Tree::concat_ref(&self.root, &other.root, &self.refs),
-            refs: self.refs.clone(),
+            root: Tree::concat_ref(refs, &self.root, &other.root),
         }
     }
-    pub fn concat_mut(&mut self, other: Self) {
-        assert!(self.refs.same_region(&other.refs));
+    pub fn concat_mut(&mut self, refs: &mut R, other: Self) {
         let left = self.take_root();
-        self.root = Tree::concat(left, other.root, &self.refs);
+        self.root = Tree::concat(refs, left, other.root);
     }
-    pub fn into_concat(mut self, other: Self) -> Self {
-        self.concat_mut(other);
+    pub fn into_concat(mut self, refs: &mut R, other: Self) -> Self {
+        self.concat_mut(refs, other);
         self
     }
-    pub fn view_front(&self) -> Option<(A, Self)> {
-        let (head, root) = self.root.view_front_ref(&self.refs)?;
-        Some((
-            Node::clone_leaf(&head, &self.refs),
-            Self {
-                root,
-                refs: self.refs.clone(),
-            },
-        ))
+    pub fn view_front(&self, refs: &mut R) -> Option<(A, Self)> {
+        let (head, root) = Tree::view_front_with(refs, self.root.0.clone())?;
+        Some((Node::leaf_value(refs, &head), Self { root }))
     }
-    pub fn view_back(&self) -> Option<(Self, A)> {
-        let (root, last) = self.root.view_back_ref(&self.refs)?;
-        Some((
-            Self {
-                root,
-                refs: self.refs.clone(),
-            },
-            Node::clone_leaf(&last, &self.refs),
-        ))
+    pub fn view_back(&self, refs: &mut R) -> Option<(Self, A)> {
+        let (root, last) = Tree::view_back_with(refs, self.root.0.clone())?;
+        Some((Self { root }, Node::leaf_value(refs, &last)))
     }
-    pub fn pop_front(&mut self) -> Option<A> {
+    pub fn pop_front(&mut self, refs: &mut R) -> Option<A> {
         let old = self.take_root();
-        let (head, rest) = match old.view_front(&self.refs) {
-            Some(view) => view,
-            None => return None,
-        };
+        let (head, rest) = Tree::view_front_with(refs, old.0)?;
         self.root = rest;
-        Some(Node::into_leaf(head, &self.refs))
+        Some(Node::leaf_value(refs, &head))
     }
-    pub fn pop_back(&mut self) -> Option<A> {
+    pub fn pop_back(&mut self, refs: &mut R) -> Option<A> {
         let old = self.take_root();
-        let (rest, last) = match old.view_back(&self.refs) {
-            Some(view) => view,
-            None => return None,
-        };
+        let (rest, last) = Tree::view_back_with(refs, old.0)?;
         self.root = rest;
-        Some(Node::into_leaf(last, &self.refs))
+        Some(Node::leaf_value(refs, &last))
     }
-    pub fn into_view_front(mut self) -> Option<(A, Self)> {
-        self.pop_front().map(|value| (value, self))
+    pub fn into_view_front(mut self, refs: &mut R) -> Option<(A, Self)> {
+        self.pop_front(refs).map(|value| (value, self))
     }
-    pub fn into_view_back(mut self) -> Option<(Self, A)> {
-        self.pop_back().map(|value| (self, value))
+    pub fn into_view_back(mut self, refs: &mut R) -> Option<(Self, A)> {
+        self.pop_back(refs).map(|value| (self, value))
     }
-    pub fn split<F>(&self, pred: F) -> Option<(Self, A, Self)>
+    pub fn split<F>(&self, refs: &mut R, pred: F) -> Option<(Self, A, Self)>
     where
         F: Fn(&A::Measure) -> bool,
     {
         let (front, mid, back) =
-            self.root
-                .split_offset_ref(A::Measure::empty(), &pred, &self.refs)?;
-        let mid = Node::clone_leaf(&mid, &self.refs);
-        Some((
-            Self {
-                root: front,
-                refs: self.refs.clone(),
-            },
-            mid,
-            Self {
-                root: back,
-                refs: self.refs.clone(),
-            },
-        ))
+            Tree::split_offset_with(refs, self.root.0.clone(), A::Measure::empty(), &pred)?;
+        let mid = Node::leaf_value(refs, &mid);
+        Some((Self { root: front }, mid, Self { root: back }))
     }
-    pub fn into_split<F>(self, pred: F) -> Option<(Self, A, Self)>
+    pub fn into_split<F>(self, refs: &mut R, pred: F) -> Option<(Self, A, Self)>
     where
         F: Fn(&A::Measure) -> bool,
     {
-        let refs = self.refs;
-        let (front, mid, back) = self.root.split_offset(A::Measure::empty(), &pred, &refs)?;
-        let mid = Node::into_leaf(mid, &refs);
-        Some((
-            Self {
-                root: front,
-                refs: refs.clone(),
-            },
-            mid,
-            Self { root: back, refs },
-        ))
+        let (front, mid, back) =
+            Tree::split_offset_with(refs, self.root.0, A::Measure::empty(), &pred)?;
+        let mid = Node::leaf_value(refs, &mid);
+        Some((Self { root: front }, mid, Self { root: back }))
     }
 
     fn take_root(&mut self) -> Tree<A, R> {
         std::mem::replace(&mut self.root, Tree::empty())
     }
-}
 
-impl<A: Measured> FingerTree<A, ArenaFamily<A>> {
-    pub fn new_arena() -> Self {
-        Self::new_in(ArenaFamily::new())
-    }
-    pub fn with_arena_capacity(capacity: usize) -> Self {
-        Self::new_in(ArenaFamily::with_capacity(capacity))
+    fn map_refs<S, FN, FT>(&self, node_map: &FN, tree_map: &FT) -> FingerTree<A, S>
+    where
+        S: FingerTreeRefs<A>,
+        FN: Fn(&NodeRef<A, R>) -> NodeRef<A, S>,
+        FT: Fn(&TreeRef<A, R>) -> TreeRef<A, S>,
+    {
+        FingerTree {
+            root: self.root.map_refs(node_map, tree_map),
+        }
     }
 }
 
 impl<A, R> Default for FingerTree<A, R>
 where
     A: Measured,
-    R: RefFamily<A> + Default,
+    R: FingerTreeRefs<A>,
 {
     fn default() -> Self {
         Self::new()
@@ -532,7 +864,7 @@ where
 impl<A, R> Measured for FingerTree<A, R>
 where
     A: Measured,
-    R: RefFamily<A>,
+    R: FingerTreeRefs<A>,
 {
     type Measure = A::Measure;
     fn measure(&self) -> Self::Measure {
@@ -540,28 +872,20 @@ where
     }
 }
 
-impl<A, R> FromIterator<A> for FingerTree<A, R>
+impl<A> FromIterator<A> for FingerTree<A>
 where
     A: Measured,
-    R: RefFamily<A> + Default,
 {
     fn from_iter<T: IntoIterator<Item = A>>(iter: T) -> Self {
-        let refs = R::default();
-        Self {
-            root: Tree::from_nodes(
-                iter.into_iter()
-                    .map(|value| refs.alloc_node(Node::leaf(value))),
-                &refs,
-            ),
-            refs,
-        }
+        let mut refs = FingerTreeStore::default();
+        Self::from_iter_in(&mut refs, iter)
     }
 }
 
 impl<A, R> Measured for Tree<A, R>
 where
     A: Measured,
-    R: RefFamily<A>,
+    R: FingerTreeRefs<A>,
 {
     type Measure = A::Measure;
     fn measure(&self) -> Self::Measure {
@@ -575,26 +899,34 @@ where
 impl<A, R> Tree<A, R>
 where
     A: Measured,
-    R: RefFamily<A>,
+    R: FingerTreeRefs<A>,
 {
     fn empty() -> Self {
         Self(TreeInner::Empty)
     }
-    fn single(node: NodeRef<A, R>, refs: &R) -> Self {
+    fn single(refs: &R, node: NodeRef<A, R>) -> Self {
         Self(TreeInner::Single {
             measure: node_measure(refs, &node),
             node,
         })
     }
     fn deep(
+        refs: &R,
         prefix: Digit<NodeRef<A, R>>,
         deeper: TreeRef<A, R>,
         suffix: Digit<NodeRef<A, R>>,
-        refs: &R,
     ) -> Self {
         let measure = digit_measure(&prefix, refs)
             .merge(tree_measure(refs, &deeper))
             .merge(digit_measure(&suffix, refs));
+        Self::deep_with_measure(measure, prefix, deeper, suffix)
+    }
+    fn deep_with_measure(
+        measure: A::Measure,
+        prefix: Digit<NodeRef<A, R>>,
+        deeper: TreeRef<A, R>,
+        suffix: Digit<NodeRef<A, R>>,
+    ) -> Self {
         Self(TreeInner::Deep {
             measure,
             prefix,
@@ -602,102 +934,146 @@ where
             suffix,
         })
     }
-    fn clone_inner(&self) -> TreeInner<A, R> {
-        self.0.clone()
+    fn clone_inner_from_ref(refs: &R, tree: &TreeRef<A, R>) -> TreeInner<A, R> {
+        refs.clone_tree_ref(tree).0
     }
-    fn clone_inner_from_ref(tree: &TreeRef<A, R>, refs: &R) -> TreeInner<A, R> {
-        refs.with_tree(tree, |tree| tree.clone_inner())
+    fn front_node(&self) -> Option<NodeRef<A, R>> {
+        match &self.0 {
+            TreeInner::Empty => None,
+            TreeInner::Single { node, .. } => Some(node.clone()),
+            TreeInner::Deep { prefix, .. } => prefix.first(),
+        }
+    }
+    fn back_node(&self) -> Option<NodeRef<A, R>> {
+        match &self.0 {
+            TreeInner::Empty => None,
+            TreeInner::Single { node, .. } => Some(node.clone()),
+            TreeInner::Deep { suffix, .. } => suffix.last(),
+        }
     }
 
-    fn push_front(self, node: NodeRef<A, R>, refs: &R) -> Self {
+    fn push_front(self, refs: &mut R, node: NodeRef<A, R>) -> Self {
         match self.0 {
-            TreeInner::Empty => Self::single(node, refs),
-            TreeInner::Single { node: old, .. } => Self::deep(
-                Digit::One([node]),
-                refs.alloc_tree(Self::empty()),
-                Digit::One([old]),
-                refs,
-            ),
+            TreeInner::Empty => Self::single(refs, node),
+            TreeInner::Single { measure, node: old } => {
+                let deeper = refs.alloc_tree(Self::empty());
+                Self::deep_with_measure(
+                    node_measure(refs, &node).merge(measure),
+                    Digit::One([node]),
+                    deeper,
+                    Digit::One([old]),
+                )
+            }
             TreeInner::Deep {
+                measure,
                 prefix: Digit::Four([a, b, c, d]),
                 deeper,
                 suffix,
-                ..
-            } => Self::deep(
-                Digit::Two([node, a]),
-                refs.alloc_tree(
-                    refs.into_tree(deeper)
-                        .push_front(refs.alloc_node(Node::branch3(b, c, d, refs)), refs),
-                ),
-                suffix,
-                refs,
-            ),
+            } => {
+                let branch = Node::branch3(refs, b, c, d);
+                let branch = refs.alloc_node(branch);
+                let deeper_tree = refs.clone_tree_ref(&deeper);
+                let deeper_tree = deeper_tree.push_front(refs, branch);
+                let deeper = refs.alloc_tree(deeper_tree);
+                Self::deep_with_measure(
+                    node_measure(refs, &node).merge(measure),
+                    Digit::Two([node, a]),
+                    deeper,
+                    suffix,
+                )
+            }
             TreeInner::Deep {
+                measure,
                 prefix,
                 deeper,
                 suffix,
-                ..
-            } => Self::deep(prefix.push_front(node), deeper, suffix, refs),
+            } => Self::deep_with_measure(
+                node_measure(refs, &node).merge(measure),
+                prefix.push_front(node),
+                deeper,
+                suffix,
+            ),
         }
     }
 
-    fn push_back(self, node: NodeRef<A, R>, refs: &R) -> Self {
+    fn push_front_mut(&mut self, refs: &mut R, node: NodeRef<A, R>) {
+        if matches!(self.0, TreeInner::Empty) {
+            *self = Self::single(refs, node);
+            return;
+        }
+
+        let old = std::mem::replace(self, Self::empty());
+        *self = old.push_front(refs, node);
+    }
+
+    fn push_back(self, refs: &mut R, node: NodeRef<A, R>) -> Self {
         match self.0 {
-            TreeInner::Empty => Self::single(node, refs),
-            TreeInner::Single { node: old, .. } => Self::deep(
-                Digit::One([old]),
-                refs.alloc_tree(Self::empty()),
-                Digit::One([node]),
-                refs,
-            ),
+            TreeInner::Empty => Self::single(refs, node),
+            TreeInner::Single { measure, node: old } => {
+                let deeper = refs.alloc_tree(Self::empty());
+                Self::deep_with_measure(
+                    measure.merge(node_measure(refs, &node)),
+                    Digit::One([old]),
+                    deeper,
+                    Digit::One([node]),
+                )
+            }
             TreeInner::Deep {
+                measure,
                 prefix,
                 deeper,
                 suffix: Digit::Four([a, b, c, d]),
-                ..
-            } => Self::deep(
-                prefix,
-                refs.alloc_tree(
-                    refs.into_tree(deeper)
-                        .push_back(refs.alloc_node(Node::branch3(a, b, c, refs)), refs),
-                ),
-                Digit::Two([d, node]),
-                refs,
-            ),
+            } => {
+                let branch = Node::branch3(refs, a, b, c);
+                let branch = refs.alloc_node(branch);
+                let deeper_tree = refs.clone_tree_ref(&deeper);
+                let deeper_tree = deeper_tree.push_back(refs, branch);
+                let deeper = refs.alloc_tree(deeper_tree);
+                Self::deep_with_measure(
+                    measure.merge(node_measure(refs, &node)),
+                    prefix,
+                    deeper,
+                    Digit::Two([d, node]),
+                )
+            }
             TreeInner::Deep {
+                measure,
                 prefix,
                 deeper,
                 suffix,
-                ..
-            } => Self::deep(prefix, deeper, suffix.push_back(node), refs),
+            } => Self::deep_with_measure(
+                measure.merge(node_measure(refs, &node)),
+                prefix,
+                deeper,
+                suffix.push_back(node),
+            ),
         }
     }
-    fn from_nodes<I>(iter: I, refs: &R) -> Self
+
+    fn push_back_mut(&mut self, refs: &mut R, node: NodeRef<A, R>) {
+        if matches!(self.0, TreeInner::Empty) {
+            *self = Self::single(refs, node);
+            return;
+        }
+
+        let old = std::mem::replace(self, Self::empty());
+        *self = old.push_back(refs, node);
+    }
+    fn from_nodes<I>(refs: &mut R, iter: I) -> Self
     where
         I: IntoIterator<Item = NodeRef<A, R>>,
     {
-        iter.into_iter()
-            .fold(Self::empty(), |tree, node| tree.push_back(node, refs))
+        let mut tree = Self::empty();
+        for node in iter {
+            tree = tree.push_back(refs, node);
+        }
+        tree
     }
-    fn from_optional_digit(digit: Option<Digit<NodeRef<A, R>>>, refs: &R) -> Self {
-        digit.map_or(Self::empty(), |digit| Self::from_nodes(digit, refs))
-    }
-
-    fn view_front(self, refs: &R) -> Option<(NodeRef<A, R>, Self)> {
-        Self::view_front_with::<OwnedPath>(self.0, refs)
-    }
-
-    fn view_back(self, refs: &R) -> Option<(Self, NodeRef<A, R>)> {
-        Self::view_back_with::<OwnedPath>(self.0, refs)
-    }
-    fn view_front_ref(&self, refs: &R) -> Option<(NodeRef<A, R>, Self)> {
-        Self::view_front_with::<SharedPath>(self.clone_inner(), refs)
+    fn from_optional_digit(refs: &mut R, digit: Option<Digit<NodeRef<A, R>>>) -> Self {
+        digit.map_or(Self::empty(), |digit| Self::from_nodes(refs, digit))
     }
 
-    fn view_front_with<P>(layer: TreeInner<A, R>, refs: &R) -> Option<(NodeRef<A, R>, Self)>
-    where
-        P: TreePath<A, R>,
-    {
+    fn view_front_with(refs: &mut R, layer: TreeInner<A, R>) -> Option<(NodeRef<A, R>, Self)> {
         match layer {
             TreeInner::Empty => None,
             TreeInner::Single { node, .. } => Some((node, Self::empty())),
@@ -708,18 +1084,12 @@ where
                 ..
             } => {
                 let (head, tail) = prefix.view_front();
-                Some((head, Self::deep_left_with::<P>(tail, deeper, suffix, refs)))
+                Some((head, Self::deep_left_with(refs, tail, deeper, suffix)))
             }
         }
     }
-    fn view_back_ref(&self, refs: &R) -> Option<(Self, NodeRef<A, R>)> {
-        Self::view_back_with::<SharedPath>(self.clone_inner(), refs)
-    }
 
-    fn view_back_with<P>(layer: TreeInner<A, R>, refs: &R) -> Option<(Self, NodeRef<A, R>)>
-    where
-        P: TreePath<A, R>,
-    {
+    fn view_back_with(refs: &mut R, layer: TreeInner<A, R>) -> Option<(Self, NodeRef<A, R>)> {
         match layer {
             TreeInner::Empty => None,
             TreeInner::Single { node, .. } => Some((Self::empty(), node)),
@@ -730,89 +1100,56 @@ where
                 ..
             } => {
                 let (init, last) = suffix.view_back();
-                Some((Self::deep_right_with::<P>(prefix, deeper, init, refs), last))
+                Some((Self::deep_right_with(refs, prefix, deeper, init), last))
             }
         }
     }
 
-    fn deep_left_with<P>(
+    fn deep_left_with(
+        refs: &mut R,
         prefix: Option<Digit<NodeRef<A, R>>>,
         deeper: TreeRef<A, R>,
         suffix: Digit<NodeRef<A, R>>,
-        refs: &R,
-    ) -> Self
-    where
-        P: TreePath<A, R>,
-    {
+    ) -> Self {
         match prefix {
-            Some(prefix) => Self::deep(prefix, deeper, suffix, refs),
-            None => match Self::view_front_with::<P>(P::tree_inner(deeper, refs), refs) {
-                Some((node, rest)) => Self::deep(
-                    P::node_digit(node, refs),
-                    refs.alloc_tree(rest),
-                    suffix,
-                    refs,
-                ),
-                None => Self::from_nodes(suffix, refs),
+            Some(prefix) => Self::deep(refs, prefix, deeper, suffix),
+            None => match Self::view_front_with(refs, Tree::clone_inner_from_ref(refs, &deeper)) {
+                Some((node, rest)) => {
+                    let prefix = Node::to_digit(refs, &node);
+                    let deeper = refs.alloc_tree(rest);
+                    Self::deep(refs, prefix, deeper, suffix)
+                }
+                None => Self::from_nodes(refs, suffix),
             },
         }
     }
 
-    fn deep_right_with<P>(
+    fn deep_right_with(
+        refs: &mut R,
         prefix: Digit<NodeRef<A, R>>,
         deeper: TreeRef<A, R>,
         suffix: Option<Digit<NodeRef<A, R>>>,
-        refs: &R,
-    ) -> Self
-    where
-        P: TreePath<A, R>,
-    {
+    ) -> Self {
         match suffix {
-            Some(suffix) => Self::deep(prefix, deeper, suffix, refs),
-            None => match Self::view_back_with::<P>(P::tree_inner(deeper, refs), refs) {
-                Some((rest, node)) => Self::deep(
-                    prefix,
-                    refs.alloc_tree(rest),
-                    P::node_digit(node, refs),
-                    refs,
-                ),
-                None => Self::from_nodes(prefix, refs),
+            Some(suffix) => Self::deep(refs, prefix, deeper, suffix),
+            None => match Self::view_back_with(refs, Tree::clone_inner_from_ref(refs, &deeper)) {
+                Some((rest, node)) => {
+                    let deeper = refs.alloc_tree(rest);
+                    let suffix = Node::to_digit(refs, &node);
+                    Self::deep(refs, prefix, deeper, suffix)
+                }
+                None => Self::from_nodes(refs, prefix),
             },
         }
     }
 
-    fn split_offset<F>(
-        self,
-        offset: A::Measure,
-        pred: &F,
-        refs: &R,
-    ) -> Option<(Self, NodeRef<A, R>, Self)>
-    where
-        F: Fn(&A::Measure) -> bool,
-    {
-        Self::split_offset_with::<OwnedPath, _>(self.0, offset, pred, refs)
-    }
-
-    fn split_offset_ref<F>(
-        &self,
-        offset: A::Measure,
-        pred: &F,
-        refs: &R,
-    ) -> Option<(Self, NodeRef<A, R>, Self)>
-    where
-        F: Fn(&A::Measure) -> bool,
-    {
-        Self::split_offset_with::<SharedPath, _>(self.clone_inner(), offset, pred, refs)
-    }
-
-    fn split_offset_with<P, F>(
+    fn split_offset_with<F>(
+        refs: &mut R,
         layer: TreeInner<A, R>,
         offset: A::Measure,
         pred: &F,
-        refs: &R,
     ) -> Option<(Self, NodeRef<A, R>, Self)>
     where
-        P: TreePath<A, R>,
         F: Fn(&A::Measure) -> bool,
     {
         match layer {
@@ -830,139 +1167,138 @@ where
                     let (before, node, after) =
                         digit_split_offset(prefix, offset, pred, refs).unwrap();
                     return Some((
-                        Self::from_optional_digit(before, refs),
+                        Self::from_optional_digit(refs, before),
                         node,
-                        Self::deep_left_with::<P>(after, deeper, suffix, refs),
+                        Self::deep_left_with(refs, after, deeper, suffix),
                     ));
                 }
 
                 let after_deeper = after_prefix.clone().merge(tree_measure(refs, &deeper));
                 if pred(&after_deeper) {
-                    let (before, branch, after) = Self::split_offset_with::<P, _>(
-                        P::tree_inner(deeper, refs),
+                    let (before, branch, after) = Self::split_offset_with(
+                        refs,
+                        Tree::clone_inner_from_ref(refs, &deeper),
                         after_prefix.clone(),
                         pred,
-                        refs,
                     )
                     .unwrap();
                     let (inner_before, node, inner_after) = digit_split_offset(
-                        P::node_digit(branch, refs),
+                        Node::to_digit(refs, &branch),
                         after_prefix.merge(before.measure()),
                         pred,
                         refs,
                     )
                     .unwrap();
-                    return Some((
-                        Self::deep_right_with::<P>(
-                            prefix,
-                            refs.alloc_tree(before),
-                            inner_before,
-                            refs,
-                        ),
-                        node,
-                        Self::deep_left_with::<P>(
-                            inner_after,
-                            refs.alloc_tree(after),
-                            suffix,
-                            refs,
-                        ),
-                    ));
+                    let before = refs.alloc_tree(before);
+                    let front = Self::deep_right_with(refs, prefix, before, inner_before);
+                    let after = refs.alloc_tree(after);
+                    let back = Self::deep_left_with(refs, inner_after, after, suffix);
+                    return Some((front, node, back));
                 }
 
                 let (before, node, after) = digit_split_offset(suffix, after_deeper, pred, refs)?;
                 Some((
-                    Self::deep_right_with::<P>(prefix, deeper, before, refs),
+                    Self::deep_right_with(refs, prefix, deeper, before),
                     node,
-                    Self::from_optional_digit(after, refs),
+                    Self::from_optional_digit(refs, after),
                 ))
             }
         }
     }
-    fn concat(front: Self, back: Self, refs: &R) -> Self {
-        let mut mid = std::iter::empty();
-        Self::concat_with_middle::<OwnedPath>(front.0, &mut mid, back.0, refs)
+    fn concat(refs: &mut R, front: Self, back: Self) -> Self {
+        Self::concat_with_middle(refs, front.0, NodeList::new(), back.0)
     }
 
-    fn concat_ref(front: &Self, back: &Self, refs: &R) -> Self {
-        let mut mid = std::iter::empty();
-        Self::concat_with_middle::<SharedPath>(
-            front.clone_inner(),
-            &mut mid,
-            back.clone_inner(),
-            refs,
-        )
+    fn concat_ref(refs: &mut R, front: &Self, back: &Self) -> Self {
+        Self::concat_with_middle(refs, front.0.clone(), NodeList::new(), back.0.clone())
     }
 
-    fn concat_with_middle<P>(
+    fn concat_with_middle(
+        refs: &mut R,
         front: TreeInner<A, R>,
-        mid: &mut dyn Iterator<Item = NodeRef<A, R>>,
+        mid: NodeList<A, R>,
         back: TreeInner<A, R>,
-        refs: &R,
-    ) -> Self
-    where
-        P: TreePath<A, R>,
-    {
+    ) -> Self {
         match (front, back) {
-            (TreeInner::Empty, back) => Self::push_many_front(mid, Self(back), refs),
-            (front, TreeInner::Empty) => Self::push_many_back(Self(front), mid, refs),
+            (TreeInner::Empty, back) => Self::push_many_front(refs, mid, Self(back)),
+            (front, TreeInner::Empty) => Self::push_many_back(refs, Self(front), mid),
             (TreeInner::Single { node, .. }, back) => {
-                Self::push_many_front(mid, Self(back), refs).push_front(node, refs)
+                Self::push_many_front(refs, mid, Self(back)).push_front(refs, node)
             }
             (front, TreeInner::Single { node, .. }) => {
-                Self::push_many_back(Self(front), mid, refs).push_back(node, refs)
+                Self::push_many_back(refs, Self(front), mid).push_back(refs, node)
             }
             (
                 TreeInner::Deep {
+                    measure: left_measure,
                     prefix: left_prefix,
                     deeper: left_deeper,
                     suffix: left_suffix,
-                    ..
                 },
                 TreeInner::Deep {
+                    measure: right_measure,
                     prefix: right_prefix,
                     deeper: right_deeper,
                     suffix: right_suffix,
-                    ..
                 },
-            ) => Self::deep(
-                left_prefix,
-                refs.alloc_tree(Self::concat_with_middle::<P>(
-                    P::tree_inner(left_deeper, refs),
-                    &mut Node::lift(left_suffix.into_iter().chain(mid).chain(right_prefix), refs),
-                    P::tree_inner(right_deeper, refs),
-                    refs,
-                )),
-                right_suffix,
-                refs,
-            ),
+            ) => {
+                let measure = left_measure.merge(mid.measure.clone()).merge(right_measure);
+                let left_deeper = Tree::clone_inner_from_ref(refs, &left_deeper);
+                let right_deeper = Tree::clone_inner_from_ref(refs, &right_deeper);
+                let mid =
+                    Node::lift_list(refs, left_suffix.into_iter().chain(mid).chain(right_prefix));
+                let deeper = Self::concat_with_middle(refs, left_deeper, mid, right_deeper);
+                let deeper = refs.alloc_tree(deeper);
+                Self::deep_with_measure(measure, left_prefix, deeper, right_suffix)
+            }
         }
     }
 
-    fn push_many_front<I>(iter: &mut I, tree: Self, refs: &R) -> Self
-    where
-        I: Iterator<Item = NodeRef<A, R>> + ?Sized,
-    {
-        match iter.next() {
-            None => tree,
-            Some(node) => Self::push_many_front(iter, tree, refs).push_front(node, refs),
-        }
-    }
-
-    fn push_many_back<I>(mut tree: Self, iter: &mut I, refs: &R) -> Self
-    where
-        I: Iterator<Item = NodeRef<A, R>> + ?Sized,
-    {
-        for node in iter {
-            tree = tree.push_back(node, refs);
+    fn push_many_front(refs: &mut R, nodes: NodeList<A, R>, mut tree: Self) -> Self {
+        for node in nodes.into_iter().rev() {
+            tree = tree.push_front(refs, node);
         }
         tree
+    }
+
+    fn push_many_back(refs: &mut R, mut tree: Self, nodes: NodeList<A, R>) -> Self {
+        for node in nodes {
+            tree = tree.push_back(refs, node);
+        }
+        tree
+    }
+
+    fn map_refs<S, FN, FT>(&self, node_map: &FN, tree_map: &FT) -> Tree<A, S>
+    where
+        S: FingerTreeRefs<A>,
+        FN: Fn(&NodeRef<A, R>) -> NodeRef<A, S>,
+        FT: Fn(&TreeRef<A, R>) -> TreeRef<A, S>,
+    {
+        Tree(match &self.0 {
+            TreeInner::Empty => TreeInner::Empty,
+            TreeInner::Single { measure, node } => TreeInner::Single {
+                measure: measure.clone(),
+                node: node_map(node),
+            },
+            TreeInner::Deep {
+                measure,
+                prefix,
+                deeper,
+                suffix,
+            } => TreeInner::Deep {
+                measure: measure.clone(),
+                prefix: prefix.map(node_map),
+                deeper: tree_map(deeper),
+                suffix: suffix.map(node_map),
+            },
+        })
     }
 }
 
 impl<A, R> Node<A, R>
 where
     A: Measured,
-    R: RefFamily<A>,
+    R: FingerTreeRefs<A>,
 {
     fn leaf(value: A) -> Self {
         Self {
@@ -970,14 +1306,14 @@ where
             inner: NodeInner::Leaf(value),
         }
     }
-    fn branch2(left: NodeRef<A, R>, right: NodeRef<A, R>, refs: &R) -> Self {
+    fn branch2(refs: &R, left: NodeRef<A, R>, right: NodeRef<A, R>) -> Self {
         let measure = node_refs_measure(refs, [&left, &right].into_iter());
         Self {
             measure,
             inner: NodeInner::Branch2 { left, right },
         }
     }
-    fn branch3(left: NodeRef<A, R>, middle: NodeRef<A, R>, right: NodeRef<A, R>, refs: &R) -> Self {
+    fn branch3(refs: &R, left: NodeRef<A, R>, middle: NodeRef<A, R>, right: NodeRef<A, R>) -> Self {
         let measure = node_refs_measure(refs, [&left, &middle, &right].into_iter());
         Self {
             measure,
@@ -988,64 +1324,60 @@ where
             },
         }
     }
-    fn into_leaf(node: NodeRef<A, R>, refs: &R) -> A {
-        match refs.into_node(node).inner {
-            NodeInner::Leaf(value) => value,
-            NodeInner::Branch2 { .. } | NodeInner::Branch3 { .. } => {
-                // 对外的 view/split 只会在根层调用；论文里这一层的逻辑元素
-                // 类型是 `A`。
-                unreachable!("top-level tree operation returned an internal branch")
-            }
-        }
+    fn leaf_value(refs: &R, node: &NodeRef<A, R>) -> A {
+        refs.leaf_value(node)
     }
-    fn clone_leaf(node: &NodeRef<A, R>, refs: &R) -> A {
-        refs.with_node(node, |node| match &node.inner {
-            NodeInner::Leaf(value) => value.clone(),
-            NodeInner::Branch2 { .. } | NodeInner::Branch3 { .. } => {
-                // 对外的 view/split 只会在根层调用；论文里这一层的逻辑元素
-                // 类型是 `A`。
-                unreachable!("top-level tree operation returned an internal branch")
-            }
-        })
+    fn to_digit(refs: &R, node: &NodeRef<A, R>) -> Digit<NodeRef<A, R>> {
+        refs.node_to_digit(node)
     }
-    fn into_digit(node: NodeRef<A, R>, refs: &R) -> Digit<NodeRef<A, R>> {
-        match refs.into_node(node).inner {
-            NodeInner::Branch2 { left, right } => Digit::Two([left, right]),
-            NodeInner::Branch3 {
-                left,
-                middle,
-                right,
-            } => Digit::Three([left, middle, right]),
-            // 只有来自中间树的递归结果会被展开成 Digit。论文里这些树的元素类型是
-            // `Node v a`，不可能是 `a`。
-            NodeInner::Leaf(_) => unreachable!("leaf node cannot be unlifted"),
-        }
-    }
-    fn to_digit(node: &NodeRef<A, R>, refs: &R) -> Digit<NodeRef<A, R>> {
-        refs.with_node(node, |node| match &node.inner {
-            NodeInner::Branch2 { left, right } => Digit::Two([left.clone(), right.clone()]),
-            NodeInner::Branch3 {
-                left,
-                middle,
-                right,
-            } => Digit::Three([left.clone(), middle.clone(), right.clone()]),
-            // 只有来自中间树的递归结果会被展开成 Digit。论文里这些树的元素类型是
-            // `Node v a`，不可能是 `a`。
-            NodeInner::Leaf(_) => unreachable!("leaf node cannot be unlifted"),
-        })
-    }
-    fn lift<I>(iter: I, refs: &R) -> LiftNodeIter<A, R, I::IntoIter>
+    fn lift<'a, I>(refs: &'a mut R, iter: I) -> LiftNodeIter<'a, A, R, I::IntoIter>
     where
         I: IntoIterator<Item = NodeRef<A, R>>,
     {
-        LiftNodeIter::new(iter.into_iter(), refs.clone())
+        LiftNodeIter::new(refs, iter.into_iter())
+    }
+    fn lift_list<I>(refs: &mut R, iter: I) -> NodeList<A, R>
+    where
+        I: IntoIterator<Item = NodeRef<A, R>>,
+    {
+        let mut nodes = NodeList::new();
+        for (node, measure) in Self::lift(refs, iter) {
+            nodes.push(node, measure);
+        }
+        nodes
+    }
+
+    fn map_refs<S, F>(&self, node_map: &F) -> Node<A, S>
+    where
+        S: FingerTreeRefs<A>,
+        F: Fn(&NodeRef<A, R>) -> NodeRef<A, S>,
+    {
+        Node {
+            measure: self.measure.clone(),
+            inner: match &self.inner {
+                NodeInner::Leaf(value) => NodeInner::Leaf(value.clone()),
+                NodeInner::Branch2 { left, right } => NodeInner::Branch2 {
+                    left: node_map(left),
+                    right: node_map(right),
+                },
+                NodeInner::Branch3 {
+                    left,
+                    middle,
+                    right,
+                } => NodeInner::Branch3 {
+                    left: node_map(left),
+                    middle: node_map(middle),
+                    right: node_map(right),
+                },
+            },
+        }
     }
 }
 
 impl<A, R> Measured for Node<A, R>
 where
     A: Measured,
-    R: RefFamily<A>,
+    R: FingerTreeRefs<A>,
 {
     type Measure = A::Measure;
     fn measure(&self) -> Self::Measure {
@@ -1061,6 +1393,18 @@ impl<A> Digit<A> {
             Self::Three(items) => items,
             Self::Four(items) => items,
         }
+    }
+    fn first(&self) -> Option<A>
+    where
+        A: Clone,
+    {
+        self.as_slice().first().cloned()
+    }
+    fn last(&self) -> Option<A>
+    where
+        A: Clone,
+    {
+        self.as_slice().last().cloned()
     }
 
     fn push_front(self, value: A) -> Self {
@@ -1106,6 +1450,18 @@ impl<A> Digit<A> {
             Self::Four([a, b, c, d]) => (Some(Self::Three([a, b, c])), d),
         }
     }
+
+    fn map<B, F>(&self, f: &F) -> Digit<B>
+    where
+        F: Fn(&A) -> B,
+    {
+        match self {
+            Self::One([a]) => Digit::One([f(a)]),
+            Self::Two([a, b]) => Digit::Two([f(a), f(b)]),
+            Self::Three([a, b, c]) => Digit::Three([f(a), f(b), f(c)]),
+            Self::Four([a, b, c, d]) => Digit::Four([f(a), f(b), f(c), f(d)]),
+        }
+    }
 }
 
 impl<A> IntoIterator for Digit<A> {
@@ -1138,26 +1494,167 @@ impl<A> Iterator for DigitIter<A> {
     }
 }
 
+impl<A, R> NodeList<A, R>
+where
+    A: Measured,
+    R: FingerTreeRefs<A>,
+{
+    fn new() -> Self {
+        Self {
+            items: std::array::from_fn(|_| None),
+            len: 0,
+            measure: A::Measure::empty(),
+        }
+    }
+    fn push(&mut self, node: NodeRef<A, R>, measure: A::Measure) {
+        // concat 中被提升的节点来自 suffix ++ middle ++ prefix。按论文的
+        // `nodes` 分组规则，结果至多 4 个；这里留 8 个槽是为了让这个动态编码
+        // 在未来微调分组时仍有余量。
+        debug_assert!(self.len < self.items.len());
+        self.measure = self.measure.clone().merge(measure);
+        self.items[self.len] = Some(node);
+        self.len += 1;
+    }
+}
+
+impl<A, R> IntoIterator for NodeList<A, R>
+where
+    A: Measured,
+    R: FingerTreeRefs<A>,
+{
+    type Item = NodeRef<A, R>;
+    type IntoIter = NodeListIter<A, R>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        NodeListIter {
+            items: self.items,
+            front: 0,
+            back: self.len,
+        }
+    }
+}
+
+impl<A, R> Iterator for NodeListIter<A, R>
+where
+    A: Measured,
+    R: FingerTreeRefs<A>,
+{
+    type Item = NodeRef<A, R>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.front == self.back {
+            return None;
+        }
+        let node = self.items[self.front].take();
+        self.front += 1;
+        node
+    }
+}
+
+impl<A, R> DoubleEndedIterator for NodeListIter<A, R>
+where
+    A: Measured,
+    R: FingerTreeRefs<A>,
+{
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.front == self.back {
+            return None;
+        }
+        self.back -= 1;
+        self.items[self.back].take()
+    }
+}
+
+impl<'a, A, R, I> LiftNodeIter<'a, A, R, I>
+where
+    A: Measured,
+    R: FingerTreeRefs<A>,
+    I: Iterator<Item = NodeRef<A, R>>,
+{
+    fn new(refs: &'a mut R, mut iter: I) -> Self {
+        let buf = [
+            iter.next(),
+            iter.next(),
+            iter.next(),
+            iter.next(),
+            iter.next(),
+        ];
+        let live = buf.iter().filter(|node| node.is_some()).count() as u8;
+        Self {
+            buf,
+            live,
+            cursor: 0,
+            iter,
+            refs,
+        }
+    }
+
+    fn pop_buffered(&mut self) -> NodeRef<A, R> {
+        let next = self.iter.next();
+        if next.is_none() {
+            self.live -= 1;
+        }
+        let node = core::mem::replace(&mut self.buf[self.cursor as usize], next).unwrap();
+        self.cursor = (self.cursor + 1) % 5;
+        node
+    }
+}
+
+impl<A, R, I> Iterator for LiftNodeIter<'_, A, R, I>
+where
+    A: Measured,
+    R: FingerTreeRefs<A>,
+    I: Iterator<Item = NodeRef<A, R>>,
+{
+    type Item = (NodeRef<A, R>, A::Measure);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.live {
+            0 => None,
+            2 | 4 => {
+                let left = self.pop_buffered();
+                let right = self.pop_buffered();
+                let node = Node::branch2(self.refs, left, right);
+                let measure = node.measure.clone();
+                Some((self.refs.alloc_node(node), measure))
+            }
+            3 | 5 => {
+                let left = self.pop_buffered();
+                let middle = self.pop_buffered();
+                let right = self.pop_buffered();
+                let node = Node::branch3(self.refs, left, middle, right);
+                let measure = node.measure.clone();
+                Some((self.refs.alloc_node(node), measure))
+            }
+            // LiftNodeIter 对应论文里的 `nodes` 辅助函数。它只在 concat 时处理
+            // 左侧后缀 ++ 中间节点 ++ 右侧前缀；两侧 digit 都非空，所以输入
+            // 长度至少为二。5 槽前瞻缓冲会把流分组成 Node2/Node3，不会留下
+            // 单个尾元素。
+            _ => unreachable!("cannot lift one remaining node"),
+        }
+    }
+}
+
 fn node_measure<A, R>(refs: &R, node: &NodeRef<A, R>) -> A::Measure
 where
     A: Measured,
-    R: RefFamily<A>,
+    R: FingerTreeRefs<A>,
 {
-    refs.with_node(node, |node| node.measure())
+    refs.measure_node_ref(node)
 }
 
 fn tree_measure<A, R>(refs: &R, tree: &TreeRef<A, R>) -> A::Measure
 where
     A: Measured,
-    R: RefFamily<A>,
+    R: FingerTreeRefs<A>,
 {
-    refs.with_tree(tree, |tree| tree.measure())
+    refs.measure_tree_ref(tree)
 }
 
 fn digit_measure<A, R>(digit: &Digit<NodeRef<A, R>>, refs: &R) -> A::Measure
 where
     A: Measured,
-    R: RefFamily<A>,
+    R: FingerTreeRefs<A>,
 {
     node_refs_measure(refs, digit.as_slice().iter())
 }
@@ -1168,7 +1665,7 @@ fn node_refs_measure<'a, A, R>(
 ) -> A::Measure
 where
     A: Measured,
-    R: RefFamily<A>,
+    R: FingerTreeRefs<A>,
     NodeRef<A, R>: 'a,
 {
     // 调用方传入的只会是 Digit、Node2 或 Node3；它们在论文的数据类型里都非空，
@@ -1186,14 +1683,10 @@ fn digit_split_offset<A, R, F>(
     offset: A::Measure,
     pred: &F,
     refs: &R,
-) -> Option<(
-    Option<Digit<NodeRef<A, R>>>,
-    NodeRef<A, R>,
-    Option<Digit<NodeRef<A, R>>>,
-)>
+) -> Option<DigitSplit<A, R>>
 where
     A: Measured,
-    R: RefFamily<A>,
+    R: FingerTreeRefs<A>,
     F: Fn(&A::Measure) -> bool,
 {
     let (head, tail) = digit.view_front();
@@ -1203,73 +1696,5 @@ where
     } else {
         let (before, node, after) = digit_split_offset(tail?, after_head, pred, refs)?;
         Some((Some(Digit::prepend_to_option(head, before)), node, after))
-    }
-}
-
-impl<A, R, I> LiftNodeIter<A, R, I>
-where
-    A: Measured,
-    R: RefFamily<A>,
-    I: Iterator<Item = NodeRef<A, R>>,
-{
-    fn new(mut iter: I, refs: R) -> Self {
-        let buf = [
-            iter.next(),
-            iter.next(),
-            iter.next(),
-            iter.next(),
-            iter.next(),
-        ];
-        let live = buf.iter().filter(|node| node.is_some()).count() as u8;
-        Self {
-            buf,
-            live,
-            cursor: 0,
-            iter,
-            refs,
-        }
-    }
-    fn pop_buffered(&mut self) -> NodeRef<A, R> {
-        let next = self.iter.next();
-        if next.is_none() {
-            self.live -= 1;
-        }
-        let ret = core::mem::replace(&mut self.buf[self.cursor as usize], next).unwrap();
-        self.cursor = (self.cursor + 1) % 5;
-        ret
-    }
-}
-
-impl<A, R, I> Iterator for LiftNodeIter<A, R, I>
-where
-    A: Measured,
-    R: RefFamily<A>,
-    I: Iterator<Item = NodeRef<A, R>>,
-{
-    type Item = NodeRef<A, R>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self.live {
-            0 => None,
-            2 | 4 => {
-                let left = self.pop_buffered();
-                let right = self.pop_buffered();
-                Some(self.refs.alloc_node(Node::branch2(left, right, &self.refs)))
-            }
-            3 | 5 => {
-                let left = self.pop_buffered();
-                let middle = self.pop_buffered();
-                let right = self.pop_buffered();
-                Some(
-                    self.refs
-                        .alloc_node(Node::branch3(left, middle, right, &self.refs)),
-                )
-            }
-            // Node::lift 对应论文里的 `nodes` 辅助函数。它只在 concat 时处理
-            // 左侧后缀 ++ 中间迭代器 ++ 右侧前缀；两侧 digit 都非空，所以输入
-            // 长度至少为二。5 槽前瞻缓冲会把流分组成 Node2/Node3，不会留下
-            // 单个尾元素。
-            _ => unreachable!("cannot lift one remaining node"),
-        }
     }
 }

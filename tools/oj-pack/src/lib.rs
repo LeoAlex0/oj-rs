@@ -553,16 +553,14 @@ impl Library {
     fn should_keep_by_reachability(&self, record: &Record, kept_names: &BTreeSet<String>) -> bool {
         match record.kind {
             RecordKind::Impl => {
-                if record.impl_self_locals.is_empty() {
-                    record
-                        .impl_trait_name
-                        .as_ref()
-                        .is_some_and(|name| kept_names.contains(name))
-                } else {
-                    record
+                let self_reachable = record.impl_self_locals.is_empty()
+                    || record
                         .impl_self_locals
                         .iter()
-                        .any(|name| kept_names.contains(name))
+                        .any(|name| kept_names.contains(name));
+                match &record.impl_trait_name {
+                    Some(trait_name) => self_reachable && kept_names.contains(trait_name),
+                    None => self_reachable,
                 }
             }
             RecordKind::MacroUse => record.local_refs.iter().any(|name| {
@@ -686,7 +684,11 @@ impl Library {
                         out.push(Item::Use(item));
                     }
                 }
-                ModuleItem::Use(item) if module_has_code => out.push(Item::Use(item.clone())),
+                ModuleItem::Use(item) if module_has_code => {
+                    if let Some(item) = self.prune_use(item, &module.path, kept) {
+                        out.push(Item::Use(item));
+                    }
+                }
                 ModuleItem::Use(_) => {}
                 ModuleItem::Item(key) if kept.contains(key) => {
                     out.push(self.records[*key].item.clone());
@@ -725,6 +727,63 @@ impl Library {
         let mut item = item.clone();
         item.tree = self.prune_reexport_tree(&item.tree, module_path, kept)?;
         Some(item)
+    }
+
+    fn prune_use(
+        &self,
+        item: &ItemUse,
+        module_path: &[String],
+        kept: &BTreeSet<ItemKey>,
+    ) -> Option<ItemUse> {
+        let mut item = item.clone();
+        item.tree = self.prune_use_tree(&item.tree, module_path, kept)?;
+        Some(item)
+    }
+
+    fn prune_use_tree(
+        &self,
+        tree: &UseTree,
+        module_path: &[String],
+        kept: &BTreeSet<ItemKey>,
+    ) -> Option<UseTree> {
+        match tree {
+            UseTree::Path(path) => {
+                let child_path = resolve_use_path_segment(module_path, &path.ident);
+                let mut path = path.clone();
+                path.tree = Box::new(self.prune_use_tree(&path.tree, &child_path, kept)?);
+                Some(UseTree::Path(path))
+            }
+            UseTree::Name(name) => {
+                let exported = self.exported_matching(module_path, Some(&name.ident.to_string()));
+                (exported.is_empty() || exported.into_iter().any(|key| kept.contains(&key)))
+                    .then(|| tree.clone())
+            }
+            UseTree::Rename(rename) => {
+                let exported = self.exported_matching(module_path, Some(&rename.ident.to_string()));
+                (exported.is_empty() || exported.into_iter().any(|key| kept.contains(&key)))
+                    .then(|| tree.clone())
+            }
+            UseTree::Glob(_) => {
+                let exported = self.exported_matching(module_path, None);
+                (exported.is_empty() || exported.into_iter().any(|key| kept.contains(&key)))
+                    .then(|| tree.clone())
+            }
+            UseTree::Group(group) => {
+                let mut items = Punctuated::<UseTree, Token![,]>::new();
+                for item in &group.items {
+                    if let Some(item) = self.prune_use_tree(item, module_path, kept) {
+                        items.push(item);
+                    }
+                }
+                if items.is_empty() {
+                    None
+                } else {
+                    let mut group = group.clone();
+                    group.items = items;
+                    Some(UseTree::Group(group))
+                }
+            }
+        }
     }
 
     fn prune_reexport_tree(
@@ -979,7 +1038,7 @@ fn impl_signature(item: &Item) -> (BTreeSet<String>, Option<String>) {
     let Item::Impl(item) = item else {
         return (BTreeSet::new(), None);
     };
-    let self_locals = local_type_idents(&item.self_ty);
+    let self_locals = local_self_type_idents(&item.self_ty);
     let trait_name = item
         .trait_
         .as_ref()
@@ -1029,40 +1088,60 @@ fn item_names(item: &Item) -> BTreeSet<String> {
     names
 }
 
-fn local_type_idents(ty: &Type) -> BTreeSet<String> {
-    collect_idents(ty.to_token_stream())
-        .into_iter()
-        .filter(|name| {
-            !matches!(
-                name.as_str(),
-                "Box"
-                    | "Rc"
-                    | "Arc"
-                    | "Vec"
-                    | "Option"
-                    | "Result"
-                    | "String"
-                    | "usize"
-                    | "u8"
-                    | "u16"
-                    | "u32"
-                    | "u64"
-                    | "u128"
-                    | "isize"
-                    | "i8"
-                    | "i16"
-                    | "i32"
-                    | "i64"
-                    | "i128"
-                    | "f32"
-                    | "f64"
-                    | "bool"
-                    | "char"
-                    | "str"
-                    | "Self"
-            )
-        })
-        .collect()
+fn local_self_type_idents(ty: &Type) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    collect_self_type_idents(ty, &mut names);
+    names
+}
+
+fn collect_self_type_idents(ty: &Type, names: &mut BTreeSet<String>) {
+    match ty {
+        Type::Path(ty) => {
+            if ty.qself.is_none() {
+                if let Some(segment) = ty.path.segments.last() {
+                    let name = segment.ident.to_string();
+                    if !is_builtin_type_name(&name) {
+                        names.insert(name);
+                    }
+                }
+            }
+        }
+        Type::Reference(ty) => collect_self_type_idents(&ty.elem, names),
+        Type::Paren(ty) => collect_self_type_idents(&ty.elem, names),
+        Type::Group(ty) => collect_self_type_idents(&ty.elem, names),
+        _ => {}
+    }
+}
+
+fn is_builtin_type_name(name: &str) -> bool {
+    matches!(
+        name,
+        "Box"
+            | "Rc"
+            | "Arc"
+            | "Vec"
+            | "Option"
+            | "Result"
+            | "String"
+            | "usize"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "isize"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "f32"
+            | "f64"
+            | "bool"
+            | "char"
+            | "str"
+            | "Self"
+    )
 }
 
 fn is_pub_item(item: &Item) -> bool {
@@ -1444,7 +1523,7 @@ mod tests {
         )
         .expect("pack luogu_p3372");
 
-        assert!(output.contains("pub enum SegTree"));
+        assert!(output.contains("pub struct SegTree"));
         assert!(output.contains("pub struct Sum"));
         assert!(output.contains("pub struct Product"));
         assert!(!output.contains("pub mod finger_tree"));
@@ -1526,9 +1605,9 @@ mod tests {
         .expect("pack luogu_p1383");
 
         assert!(output.contains("pub mod finger_tree"));
-        assert!(output.contains("ArenaFingerTree"));
-        assert!(!output.contains("BoxFingerTree"));
-        assert!(!output.contains("BoxFamily"));
+        assert!(output.contains("FingerTreeStore"));
+        assert!(!output.contains("ArcFingerTree"));
+        assert!(!output.contains("ArcStore"));
     }
 
     #[test]

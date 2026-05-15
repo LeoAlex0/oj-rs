@@ -1,4 +1,4 @@
-use solution::data_structure::seg_tree::prelude::*;
+use solution::data_structure::seg_tree::{Applier, SegTree, SegTreeStore};
 use solution::io::Scanner;
 use solution::traits::prelude::{Monoid, Semigroup};
 
@@ -82,7 +82,9 @@ fn main() {
 
     let init_value: Vec<u32> = (0..len).map(|_| input.read()).collect();
 
-    let mut tree: SegTree<_, Linear> = SegTree::build(len, |i| (Sum(init_value[i]), Size(1)));
+    let mut store = SegTreeStore::default();
+    let mut tree: SegTree<_, Linear> =
+        SegTree::build_in(&mut store, len, |i| (Sum(init_value[i]), Size(1)));
 
     for _ in 0..num_commands {
         let op: u8 = input.read();
@@ -92,15 +94,15 @@ fn main() {
             1 => {
                 let k: u32 = input.read();
                 // a[x..y] = k * a[x..y] + 0
-                tree = tree.apply(x - 1..y, Linear { k, b: 0 });
+                tree = tree.apply(&mut store, x - 1..y, Linear { k, b: 0 });
             }
             2 => {
                 let b: u32 = input.read();
                 // a[x..y] = 1 * a[x..y] + b
-                tree = tree.apply(x - 1..y, Linear { k: 1, b });
+                tree = tree.apply(&mut store, x - 1..y, Linear { k: 1, b });
             }
             3 => {
-                println!("{}", tree.query(x - 1..y).0 .0);
+                println!("{}", tree.query(&store, x - 1..y).0 .0);
             }
             _ => unreachable!(),
         }

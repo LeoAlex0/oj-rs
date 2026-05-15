@@ -5,7 +5,7 @@ use std::{
 
 use criterion::{black_box, Criterion};
 use solution::{
-    data_structure::seg_tree::prelude::*,
+    data_structure::{ref_store::ArenaStoreFactory, seg_tree::prelude::*},
     traits::prelude::{Identity, Monoid, Semigroup},
 };
 
@@ -72,11 +72,26 @@ pub fn bench(c: &mut Criterion) {
         })
     });
 
+    group.bench_function("build large arena", |b| {
+        let array: [u8; N] = array::from_fn(|i| i as u8 & 3);
+        b.iter(|| {
+            ArenaStoreFactory::scoped(N * 2, |factory| {
+                let mut arena: SegTreeStore<Value, TransposeU8, _> = SegTreeStore::new(factory);
+                let tree: SegTree<_, TransposeU8, _> =
+                    SegTree::build_in(&mut arena, N, |i| Some(Identity(array[i])));
+                black_box(tree);
+            })
+        })
+    });
+
     group.bench_function("large update", |b| {
         let array: [u8; N] = array::from_fn(|_| 1u8);
-        let tree: SegTree<_, TransposeU8> = SegTree::build(N, |i| Some(Identity(array[i])));
+        let mut store = SegTreeStore::default();
+        let tree: SegTree<_, TransposeU8> =
+            SegTree::build_in(&mut store, N, |i| Some(Identity(array[i])));
         b.iter(|| {
             black_box(black_box(tree.clone()).apply(
+                &mut store,
                 black_box(1..N - 1),
                 black_box(TransposeU8::empty().assign(1, 2)),
             ))

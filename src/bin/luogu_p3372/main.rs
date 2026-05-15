@@ -1,4 +1,4 @@
-use solution::data_structure::seg_tree::prelude::*;
+use solution::data_structure::seg_tree::{Applier, SegTree, SegTreeStore};
 use solution::io::Scanner;
 use solution::traits::prelude::*;
 
@@ -28,7 +28,9 @@ fn main() {
     let num_commands: usize = input.read();
     let init: Vec<i64> = (0..len).map(|_| input.read()).collect();
 
-    let mut tree: SegTree<_, Plus> = SegTree::build(len, |i| (Sum(init[i]), Size::default()));
+    let mut store = SegTreeStore::default();
+    let mut tree: SegTree<_, Plus> =
+        SegTree::build_in(&mut store, len, |i| (Sum(init[i]), Size::default()));
 
     for _ in 0..num_commands {
         let op: u8 = input.read();
@@ -37,9 +39,9 @@ fn main() {
         match op {
             1 => {
                 let k: i64 = input.read();
-                tree = tree.apply(x - 1..y, Plus(k));
+                tree = tree.apply(&mut store, x - 1..y, Plus(k));
             }
-            2 => println!("{}", tree.query(x - 1..y).0 .0),
+            2 => println!("{}", tree.query(&store, x - 1..y).0 .0),
             _ => unreachable!(),
         }
     }
