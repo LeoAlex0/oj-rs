@@ -11,6 +11,7 @@ pub trait RefStore<T> {
 
 pub trait RefStoreMut<T>: RefStore<T> {
     fn set_ref(&mut self, reference: &Self::Ref, value: T);
+    fn replace_ref(&mut self, reference: &Self::Ref, value: T) -> T;
 }
 
 pub trait RefStoreFactory {
@@ -305,6 +306,10 @@ impl<'id, T> RefStoreMut<T> for Arena<'id, T> {
     fn set_ref(&mut self, reference: &Self::Ref, value: T) {
         self.storage[reference.index] = value;
     }
+
+    fn replace_ref(&mut self, reference: &Self::Ref, value: T) -> T {
+        std::mem::replace(&mut self.storage[reference.index], value)
+    }
 }
 
 impl<'id, T, const N: usize> RefStore<T> for ConstArena<'id, T, N> {
@@ -348,6 +353,16 @@ impl<'id, T, const N: usize> RefStoreMut<T> for ConstArena<'id, T, N> {
             self.storage[reference.index].assume_init_drop();
         }
         self.storage[reference.index].write(value);
+    }
+
+    fn replace_ref(&mut self, reference: &Self::Ref, value: T) -> T {
+        assert!(
+            reference.index < self.len,
+            "const arena reference points outside initialized storage"
+        );
+        // SAFETY: `alloc` 只会返回小于 `len` 的下标，且该槽位已经初始化。
+        // `replace` 在原位置写入新值，并把旧值按普通 Rust 值移出交给调用方管理。
+        unsafe { std::mem::replace(self.storage[reference.index].assume_init_mut(), value) }
     }
 }
 

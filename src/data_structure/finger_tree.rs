@@ -3,10 +3,17 @@ use crate::data_structure::ref_store::{
     LayeredRef, RcStoreFactory, RefMapper, RefStore, RefStoreFactory,
 };
 use crate::traits::{monoid::Monoid, monoid::Size, semigroup::Semigroup};
-use std::marker::PhantomData;
+use std::{
+    marker::PhantomData,
+    mem::{size_of, ManuallyDrop, MaybeUninit},
+    slice,
+};
 
 pub mod prelude {
-    pub use super::{FingerTree, FingerTreeStore, Measured, Value};
+    pub use super::{
+        cache_line_chunk_capacity, chunk_capacity_for_bytes, Chunk, ChunkedFingerTree, FingerTree,
+        FingerTreeStore, Measured, Value, CACHE_LINE_BYTES,
+    };
 }
 
 pub trait Measured: Clone {
@@ -22,6 +29,268 @@ impl<T: Clone> Measured for Value<T> {
     type Measure = Size;
     fn measure(&self) -> Self::Measure {
         Size(1)
+    }
+}
+
+/// 常见 CPU cache line 的字节数。竞赛环境里通常不值得为不同机器继续细分。
+pub const CACHE_LINE_BYTES: usize = 64;
+
+/// 按目标字节数估算 `Chunk<A, N>` 的容量。
+///
+/// 这里故意只返回一个普通 `usize` 常量：stable Rust 目前还不能把依赖泛型参数的
+/// `size_of::<A>()` 结果直接塞进泛型类型的数组长度里。因此底层仍然保留
+/// `Chunk<A, const N>`，调用侧可以用这个函数生成 `N`，避免手写魔法数字。
+///
+/// 估算公式把 `Chunk` 头部的 `measure + len` 扣掉，再把剩余空间分给元素。它是保守的：
+/// 对齐带来的填充可能让真实大小略大于目标字节数；对当前 `Value<usize>`/`Size` 场景则正好
+/// 得到 64 字节 chunk。
+pub const fn chunk_capacity_for_bytes<A: Measured>(target_bytes: usize) -> usize {
+    let header = size_of::<A::Measure>() + size_of::<usize>();
+    let item = size_of::<A>();
+    let payload = target_bytes.saturating_sub(header);
+
+    if item == 0 {
+        if payload == 0 {
+            1
+        } else {
+            payload
+        }
+    } else {
+        let capacity = payload / item;
+        if capacity == 0 {
+            1
+        } else {
+            capacity
+        }
+    }
+}
+
+/// 以一个 cache line 为目标估算 `Chunk<A, N>` 的容量。
+pub const fn cache_line_chunk_capacity<A: Measured>() -> usize {
+    chunk_capacity_for_bytes::<A>(CACHE_LINE_BYTES)
+}
+
+pub struct Chunk<A: Measured, const N: usize> {
+    measure: A::Measure,
+    len: usize,
+    items: [MaybeUninit<A>; N],
+}
+
+pub struct ChunkedFingerTree<
+    A: Measured,
+    const N: usize,
+    R: FingerTreeRefs<Chunk<A, N>> = FingerTreeStore<Chunk<A, N>>,
+> {
+    chunks: FingerTree<Chunk<A, N>, R>,
+}
+
+impl<A: Measured, const N: usize> Chunk<A, N> {
+    fn empty() -> Self {
+        assert!(N > 0, "chunk capacity must be positive");
+        Self {
+            measure: A::Measure::empty(),
+            len: 0,
+            items: std::array::from_fn(|_| MaybeUninit::uninit()),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn is_full(&self) -> bool {
+        self.len == N
+    }
+
+    fn as_slice(&self) -> &[A] {
+        // SAFETY: `push_back` 只会初始化 `[0, len)`，并且 `len` 从不超过 N。
+        unsafe { slice::from_raw_parts(self.items.as_ptr().cast::<A>(), self.len) }
+    }
+
+    fn push_back(&mut self, value: A) {
+        assert!(self.len < N, "chunk capacity exceeded");
+        self.measure = self.measure.clone().merge(value.measure());
+        self.items[self.len].write(value);
+        self.len += 1;
+    }
+
+    fn first(&self) -> Option<A> {
+        self.as_slice().first().cloned()
+    }
+
+    fn last(&self) -> Option<A> {
+        self.as_slice().last().cloned()
+    }
+
+    fn split_offset<F>(
+        self,
+        mut offset: A::Measure,
+        pred: &F,
+    ) -> Option<(Option<Self>, A, Option<Self>)>
+    where
+        F: Fn(&A::Measure) -> bool,
+    {
+        let this = ManuallyDrop::new(self);
+        let mut before = Self::empty();
+        let mut after = Self::empty();
+        let mut middle = None;
+
+        for i in 0..this.len {
+            // SAFETY: `i < len`，该槽位已初始化；`ManuallyDrop` 防止之后重复析构。
+            let value = unsafe { this.items[i].as_ptr().read() };
+            if middle.is_some() {
+                after.push_back(value);
+                continue;
+            }
+
+            let next = offset.clone().merge(value.measure());
+            if pred(&next) {
+                middle = Some(value);
+            } else {
+                offset = next;
+                before.push_back(value);
+            }
+        }
+
+        let middle = middle?;
+        Some((
+            (!before.is_empty()).then_some(before),
+            middle,
+            (!after.is_empty()).then_some(after),
+        ))
+    }
+}
+
+impl<A: Measured, const N: usize> Clone for Chunk<A, N> {
+    fn clone(&self) -> Self {
+        let mut chunk = Self::empty();
+        for value in self.as_slice() {
+            chunk.push_back(value.clone());
+        }
+        chunk
+    }
+}
+
+impl<A: Measured, const N: usize> Drop for Chunk<A, N> {
+    fn drop(&mut self) {
+        for item in &mut self.items[..self.len] {
+            // SAFETY: `[0, len)` 内的元素均由 `push_back` 初始化，且只在这里析构一次。
+            unsafe {
+                item.assume_init_drop();
+            }
+        }
+    }
+}
+
+impl<A: Measured, const N: usize> Measured for Chunk<A, N> {
+    type Measure = A::Measure;
+
+    fn measure(&self) -> Self::Measure {
+        self.measure.clone()
+    }
+}
+
+impl<A, const N: usize, R> Clone for ChunkedFingerTree<A, N, R>
+where
+    A: Measured,
+    R: FingerTreeRefs<Chunk<A, N>>,
+{
+    fn clone(&self) -> Self {
+        Self {
+            chunks: self.chunks.clone(),
+        }
+    }
+}
+
+impl<A, const N: usize, R> ChunkedFingerTree<A, N, R>
+where
+    A: Measured,
+    R: FingerTreeRefs<Chunk<A, N>>,
+{
+    pub fn new() -> Self {
+        Self {
+            chunks: FingerTree::new(),
+        }
+    }
+
+    pub fn from_chunks(chunks: FingerTree<Chunk<A, N>, R>) -> Self {
+        Self { chunks }
+    }
+
+    pub fn chunks(&self) -> &FingerTree<Chunk<A, N>, R> {
+        &self.chunks
+    }
+
+    pub fn from_iter_in<T>(refs: &mut R, iter: T) -> Self
+    where
+        T: IntoIterator<Item = A>,
+    {
+        let mut chunks = FingerTree::new();
+        let mut chunk = Chunk::empty();
+        for value in iter {
+            if chunk.is_full() {
+                chunks.push_back_mut(refs, chunk);
+                chunk = Chunk::empty();
+            }
+            chunk.push_back(value);
+        }
+        if !chunk.is_empty() {
+            chunks.push_back_mut(refs, chunk);
+        }
+        Self { chunks }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.chunks.is_empty()
+    }
+
+    pub fn measure(&self) -> A::Measure {
+        self.chunks.measure()
+    }
+
+    pub fn front(&self, refs: &R) -> Option<A> {
+        self.chunks.front(refs).and_then(|chunk| chunk.first())
+    }
+
+    pub fn back(&self, refs: &R) -> Option<A> {
+        self.chunks.back(refs).and_then(|chunk| chunk.last())
+    }
+
+    pub fn concat(&self, refs: &mut R, other: &Self) -> Self {
+        Self {
+            chunks: self.chunks.concat(refs, &other.chunks),
+        }
+    }
+
+    pub fn into_concat(mut self, refs: &mut R, other: Self) -> Self {
+        self.chunks.concat_mut(refs, other.chunks);
+        self
+    }
+
+    pub fn split<F>(&self, refs: &mut R, pred: F) -> Option<(Self, A, Self)>
+    where
+        F: Fn(&A::Measure) -> bool,
+    {
+        let (mut front, chunk, mut back) = self.chunks.split(refs, |measure| pred(measure))?;
+        let offset = front.measure();
+        let (before, value, after) = chunk.split_offset(offset, &pred)?;
+        if let Some(before) = before {
+            front.push_back_mut(refs, before);
+        }
+        if let Some(after) = after {
+            back.push_front_mut(refs, after);
+        }
+        Some((Self { chunks: front }, value, Self { chunks: back }))
+    }
+}
+
+impl<A, const N: usize, R> Default for ChunkedFingerTree<A, N, R>
+where
+    A: Measured,
+    R: FingerTreeRefs<Chunk<A, N>>,
+{
+    fn default() -> Self {
+        Self::new()
     }
 }
 

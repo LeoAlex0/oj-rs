@@ -6,12 +6,24 @@ where
     Self: Semigroup,
 {
     fn empty() -> Self;
+
+    /// 性能提示：返回 true 时必须保证 `self` 等价于 `empty()`。
+    ///
+    /// 默认返回 false，以便没有显式实现的类型仍然保持正确，只是不能跳过空操作。
+    fn is_empty(&self) -> bool {
+        false
+    }
 }
 
 impl<A: Monoid, B: Monoid> Monoid for (A, B) {
     #[inline]
     fn empty() -> Self {
         (A::empty(), B::empty())
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.0.is_empty() && self.1.is_empty()
     }
 }
 
@@ -28,6 +40,11 @@ impl<T: Semigroup> Monoid for Option<T> {
     #[inline]
     fn empty() -> Self {
         None
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.is_none()
     }
 }
 
@@ -55,27 +72,50 @@ macro_rules! impl_monoid {
             }
         }
     };
+    ($t:ty, $v:expr, $is_empty:expr) => {
+        impl Monoid for $t {
+            #[inline]
+            fn empty() -> $t {
+                $v
+            }
+
+            #[inline]
+            fn is_empty(&self) -> bool {
+                $is_empty(self)
+            }
+        }
+    };
 }
 macro_rules! impl_num_monoid {
     [$($t:ty),*] => {
         $(
-        impl_monoid!(Sum<$t>, Sum(0 as $t));
-        impl_monoid!(Product<$t>, Product(1 as $t));
+        impl_monoid!(Sum<$t>, Sum(0 as $t), |value: &Sum<$t>| value.0 == 0 as $t);
+        impl_monoid!(Product<$t>, Product(1 as $t), |value: &Product<$t>| value.0 == 1 as $t);
         )*
     };
 }
 
 impl_num_monoid![u8, i8, u16, i16, u32, i32, u64, i64, u128, i128, f32, f64];
-impl_monoid!(Size, Size(0));
+impl_monoid!(Size, Size(0), |value: &Size| value.0 == 0);
 impl<T: Ord> Monoid for Min<T> {
     #[inline]
     fn empty() -> Self {
         Min::Inf
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        matches!(self, Min::Inf)
     }
 }
 impl<T: Ord> Monoid for Max<T> {
     #[inline]
     fn empty() -> Self {
         Max::NegInf
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        matches!(self, Max::NegInf)
     }
 }

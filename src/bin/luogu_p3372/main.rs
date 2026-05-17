@@ -15,10 +15,15 @@ impl Monoid for Plus {
     fn empty() -> Self {
         Plus(0)
     }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.0 == 0
+    }
 }
 impl Applier<(Sum<i64>, Size)> for Plus {
-    fn apply(&self, (Sum(s), n): (Sum<i64>, Size)) -> (Sum<i64>, Size) {
-        (Sum(s + self.0 * n.0 as i64), n)
+    fn apply(&self, (sum, size): &mut (Sum<i64>, Size)) {
+        sum.0 += self.0 * size.0 as i64;
     }
 }
 
@@ -39,7 +44,7 @@ fn main() {
         match op {
             1 => {
                 let k: i64 = input.read();
-                tree = tree.apply(&mut store, x - 1..y, Plus(k));
+                tree = tree.apply(&mut store, x - 1..y, &Plus(k));
             }
             2 => println!("{}", tree.query(&store, x - 1..y).0 .0),
             _ => unreachable!(),

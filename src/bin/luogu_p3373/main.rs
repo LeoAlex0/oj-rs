@@ -26,6 +26,10 @@ impl Monoid for Linear {
     fn empty() -> Self {
         Self { k: 1, b: 0 }
     }
+
+    fn is_empty(&self) -> bool {
+        self.k == 1 && self.b == 0
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -50,22 +54,27 @@ impl Monoid for Sum {
     fn empty() -> Self {
         Self(0)
     }
+
+    fn is_empty(&self) -> bool {
+        self.0 == 0
+    }
 }
 
 impl Monoid for Size {
     fn empty() -> Self {
-        Self(1)
+        Self(0)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0 == 0
     }
 }
 
 impl Applier<(Sum, Size)> for Linear {
     /// x' = k*x + b*n
-    fn apply(&self, (Sum(x), Size(n)): (Sum, Size)) -> (Sum, Size) {
+    fn apply(&self, (sum, size): &mut (Sum, Size)) {
         let p = unsafe { P } as u64;
-        (
-            Sum(((((self.k as u64 * x as u64) % p + (self.b as u64 * n as u64)) % p) % p) as u32),
-            Size(n),
-        )
+        sum.0 = (((self.k as u64 * sum.0 as u64) % p + (self.b as u64 * size.0 as u64)) % p) as u32;
     }
 }
 
@@ -94,12 +103,12 @@ fn main() {
             1 => {
                 let k: u32 = input.read();
                 // a[x..y] = k * a[x..y] + 0
-                tree = tree.apply(&mut store, x - 1..y, Linear { k, b: 0 });
+                tree = tree.apply(&mut store, x - 1..y, &Linear { k, b: 0 });
             }
             2 => {
                 let b: u32 = input.read();
                 // a[x..y] = 1 * a[x..y] + b
-                tree = tree.apply(&mut store, x - 1..y, Linear { k: 1, b });
+                tree = tree.apply(&mut store, x - 1..y, &Linear { k: 1, b });
             }
             3 => {
                 println!("{}", tree.query(&store, x - 1..y).0 .0);

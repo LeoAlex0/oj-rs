@@ -10,6 +10,8 @@ use solution::{
 };
 
 type Value = Option<Identity<u8>>;
+const LEAF_BLOCK_BYTES: usize = SEG_TREE_CACHE_LINE_BYTES;
+const LEAF_BLOCK: usize = seg_leaf_block_capacity_for_bytes::<Value>(LEAF_BLOCK_BYTES);
 
 #[derive(Clone)]
 struct TransposeU8(HashMap<u8, u8>);
@@ -51,23 +53,50 @@ impl Monoid for TransposeU8 {
     fn empty() -> Self {
         Self::identity()
     }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 impl Applier<Value> for TransposeU8 {
-    fn apply(&self, to: Value) -> Value {
-        to.map(|to| Identity(*self.0.get(&to.0).unwrap_or(&to.0)))
+    fn apply(&self, to: &mut Value) {
+        if let Some(to) = to {
+            to.0 = *self.0.get(&to.0).unwrap_or(&to.0);
+        }
     }
+}
+
+fn random_ranges(len: usize, count: usize) -> Vec<std::ops::Range<usize>> {
+    let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut next = || {
+        seed ^= seed << 7;
+        seed ^= seed >> 9;
+        seed ^= seed << 8;
+        seed as usize
+    };
+
+    (0..count)
+        .map(|_| {
+            let a = next() % len;
+            let b = next() % len;
+            let (start, end) = if a <= b { (a, b) } else { (b, a) };
+            start..end + 1
+        })
+        .collect()
 }
 
 pub fn bench(c: &mut Criterion) {
     const N: usize = 200_000;
+    const QUERY_COUNT: usize = 1 << 15;
 
     let mut group = c.benchmark_group("seg_tree");
 
     group.bench_function("build large", |b| {
         let array: [u8; N] = array::from_fn(|i| i as u8 & 3);
         b.iter(|| {
-            let tree: SegTree<_, TransposeU8> = SegTree::build(N, |i| Some(Identity(array[i])));
+            let tree: SegTree<_, TransposeU8, LEAF_BLOCK> =
+                SegTree::build(N, |i| Some(Identity(array[i])));
             black_box(tree);
         })
     });
@@ -76,9 +105,9 @@ pub fn bench(c: &mut Criterion) {
         let array: [u8; N] = array::from_fn(|i| i as u8 & 3);
         b.iter(|| {
             ArenaStoreFactory::scoped(N * 2, |factory| {
-                let mut arena: SegTreeStore<Value, TransposeU8, _> = SegTreeStore::new(factory);
-                let tree: SegTree<_, TransposeU8, _> =
-                    SegTree::build_in(&mut arena, N, |i| Some(Identity(array[i])));
+                let mut arena: SegTreeStore<Value, TransposeU8, _, LEAF_BLOCK> =
+                    SegTreeStore::new(factory);
+                let tree = SegTree::build_in(&mut arena, N, |i| Some(Identity(array[i])));
                 black_box(tree);
             })
         })
@@ -87,14 +116,55 @@ pub fn bench(c: &mut Criterion) {
     group.bench_function("large update", |b| {
         let array: [u8; N] = array::from_fn(|_| 1u8);
         let mut store = SegTreeStore::default();
-        let tree: SegTree<_, TransposeU8> =
+        let tree: SegTree<_, TransposeU8, LEAF_BLOCK> =
             SegTree::build_in(&mut store, N, |i| Some(Identity(array[i])));
         b.iter(|| {
-            black_box(black_box(tree.clone()).apply(
-                &mut store,
-                black_box(1..N - 1),
-                black_box(TransposeU8::empty().assign(1, 2)),
-            ))
+            let modifier = black_box(TransposeU8::empty().assign(1, 2));
+            black_box(black_box(tree.clone()).apply(&mut store, black_box(1..N - 1), &modifier))
+        })
+    });
+
+    group.bench_function("large query random", |b| {
+        let array: [u8; N] = array::from_fn(|i| i as u8 & 3);
+        let ranges = random_ranges(N, QUERY_COUNT);
+        let mut index = 0;
+        let mut store = SegTreeStore::default();
+        let tree: SegTree<_, TransposeU8, LEAF_BLOCK> =
+            SegTree::build_in(&mut store, N, |i| Some(Identity(array[i])));
+        b.iter(|| {
+            let range = &ranges[index & (QUERY_COUNT - 1)];
+            index += 1;
+            black_box(tree.query(&store, black_box(range.clone())))
+        })
+    });
+
+    group.bench_function("large query random arena", |b| {
+        let array: [u8; N] = array::from_fn(|i| i as u8 & 3);
+        let ranges = random_ranges(N, QUERY_COUNT);
+        ArenaStoreFactory::scoped(N * 2, |factory| {
+            let mut index = 0;
+            let mut store: SegTreeStore<Value, TransposeU8, _, LEAF_BLOCK> =
+                SegTreeStore::new(factory);
+            let tree = SegTree::build_in(&mut store, N, |i| Some(Identity(array[i])));
+            b.iter(|| {
+                let range = &ranges[index & (QUERY_COUNT - 1)];
+                index += 1;
+                black_box(tree.query(&store, black_box(range.clone())))
+            })
+        })
+    });
+
+    group.bench_function("large update mut arena", |b| {
+        let array: [u8; N] = array::from_fn(|_| 1u8);
+        ArenaStoreFactory::scoped(N * 2, |factory| {
+            let mut store: SegTreeStore<Value, TransposeU8, _, LEAF_BLOCK> =
+                SegTreeStore::new(factory);
+            let mut tree = SegTree::build_in(&mut store, N, |i| Some(Identity(array[i])));
+            b.iter(|| {
+                let modifier = black_box(TransposeU8::empty().assign(1, 2));
+                tree.apply_mut(&mut store, black_box(1..N - 1), &modifier);
+                black_box(&tree);
+            })
         })
     });
 

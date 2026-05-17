@@ -155,6 +155,43 @@ fn const_arena_panics_on_overflow() {
 }
 
 #[test]
+fn chunked_tree_split_and_concat() {
+    const CHUNK: usize = cache_line_chunk_capacity::<Value<usize>>();
+
+    assert_eq!(CHUNK, 6);
+    assert_eq!(
+        std::mem::size_of::<Chunk<Value<usize>, CHUNK>>(),
+        CACHE_LINE_BYTES
+    );
+
+    let mut refs = FingerTreeStore::default();
+    let tree: ChunkedFingerTree<Value<usize>, CHUNK> =
+        ChunkedFingerTree::from_iter_in(&mut refs, (0..64).map(Value));
+
+    assert_eq!(tree.measure(), Size(64));
+    assert_eq!(tree.front(&refs), Some(Value(0)));
+    assert_eq!(tree.back(&refs), Some(Value(63)));
+
+    for i in 0..64 {
+        assert_eq!(
+            tree.split(&mut refs, |len| len > &Size(i)).map(|it| it.1),
+            Some(Value(i))
+        );
+    }
+
+    let doubled = tree.concat(&mut refs, &tree);
+    assert_eq!(doubled.measure(), Size(128));
+    for i in 0..128 {
+        assert_eq!(
+            doubled
+                .split(&mut refs, |len| len > &Size(i))
+                .map(|it| it.1),
+            Some(Value(i % 64))
+        );
+    }
+}
+
+#[test]
 fn layered_arena_uses_scratch_for_results() {
     ArenaStoreFactory::scoped(4096, |factory| {
         let mut base: FingerTreeStore<Value<usize>, _> = FingerTreeStore::new(factory);
