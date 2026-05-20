@@ -35,7 +35,8 @@ cargo test -p oj-pack
 入口在 `src/main.rs`：
 
 - `Cli` / `Command` / `PackFlags` 定义 clap CLI。默认输出格式化代码，`--minify`
-  输出压缩代码。
+  输出压缩代码；默认会裁剪未使用的固有 impl 方法、关联常量和普通常量，
+  `--no-prune-impl-items` 可关闭这一步细粒度裁剪。
 - `run` 负责把 clap 解析出的 action 分发到 `pack_binary`、`list_binaries` 或
   completion 生成。
 - `pack_binary` 把 CLI 参数翻译成 `PackOptions`，再调用 `pack_project`。
@@ -57,6 +58,10 @@ cargo test -p oj-pack
 - `Library::render`：按原模块树顺序输出仍然可达的模块和 item。
   re-export-only 模块如果会被 binary 的 `use` 语句引用，也会保留对应
   `pub use`，例如 `traits::prelude`。
+- `prune_unused_fine_items`：最终输出前的细粒度 DCE。它会裁剪固有
+  `impl Type` 里的方法和关联常量，也会继续删除只被已删除候选引用的普通
+  `const`；trait impl 会完整保留。调用和常量引用按名称做保守近似，同名候选会
+  一起保留。
 - `RewriteCrateName`：把 binary 里的 `solution::...` 改为单文件内的
   `crate::...`。
 - `minify`：只在 `--minify` 时使用，按 token 判断是否必须保留空格。
@@ -78,6 +83,8 @@ DCE 是保守的近似名称解析，不是完整 Rust resolver。
 - 已保留 item 中出现的本地名称会继续保留对应 item。
 - `impl LocalType` 或 `impl Trait for LocalType` 随 self type 保留。
 - `impl LocalTrait for ExternalType` 随 trait 保留。
+- 保留后的代码会继续裁剪未使用的固有 impl 方法、关联常量和普通 `const`；候选名
+  出现在非候选代码或已保留候选体中时，该名称对应的候选会被保留。
 - 宏定义和宏调用按 item 粒度保留；宏生成 impl 时会保守保留必要的宏调用。
 
 已知会偏保守的情况：
@@ -86,6 +93,8 @@ DCE 是保守的近似名称解析，不是完整 Rust resolver。
 - glob import 会根据 binary 中出现过的标识符收窄，但不做完整作用域解析。
 - 对 trait method、associated item、泛型 bound 的解析是基于 token 中的本地
   ident，因此可能多保留，不应少保留。
+- 细粒度裁剪不做类型解析；如果不同类型有同名方法/常量且其中一个被使用，这些同名
+  候选会一起保留。带 `cfg/cfg_attr` 的候选也会保留。
 
 ## 模块解析边界
 

@@ -8,30 +8,25 @@ use crate::traits::semigroup::Semigroup;
 use std::{
     cmp::{max, min},
     marker::PhantomData,
-    mem::size_of,
+    mem::{size_of, MaybeUninit},
     ops::Range,
 };
 
 pub const SEG_TREE_CACHE_LINE_BYTES: usize = 64;
 pub const DEFAULT_SEG_LEAF_BLOCK_CAPACITY: usize = 16;
 
-/// 按目标字节数估算 `SegBlock<V, B>` 能容纳多少个叶值。
-///
-/// 和 FingerTree 的 chunk 一样，stable Rust 不能把这个依赖 `V` 大小的结果
-/// 自动作为默认 const 泛型参数；所以 `SegTree` 保留 `const B`，调用侧可以用这个
-/// 函数生成 `B`。
-pub const fn seg_leaf_block_capacity_for_bytes<V>(target_bytes: usize) -> usize {
-    let item = size_of::<V>();
-    let payload = target_bytes.saturating_sub(size_of::<V>());
+const fn capacity_for_linear_size(zero_size: usize, one_size: usize, target_bytes: usize) -> usize {
+    let item_size = one_size.saturating_sub(zero_size);
 
-    if item == 0 {
+    if item_size == 0 {
         if target_bytes == 0 {
             1
         } else {
             target_bytes
         }
     } else {
-        let capacity = payload / item;
+        let payload = target_bytes.saturating_sub(zero_size);
+        let capacity = payload / item_size;
         if capacity == 0 {
             1
         } else {
@@ -40,37 +35,61 @@ pub const fn seg_leaf_block_capacity_for_bytes<V>(target_bytes: usize) -> usize 
     }
 }
 
-/// 估算一个分支节点的载荷大小。`Ref` 用来描述不同 store 的引用宽度。
-pub const fn seg_branch_payload_bytes<V, M, Ref>() -> usize {
-    size_of::<usize>() + size_of::<M>() + size_of::<V>() + size_of::<Ref>() * 2
+#[allow(dead_code)]
+struct SegBranchLayout<V, M, Ref> {
+    left_size: usize,
+    modifier: M,
+    value: V,
+    left: Ref,
+    right: Ref,
 }
 
-/// 同时考虑分支节点大小和目标字节数，估算叶块容量。
+#[allow(dead_code)]
+enum SegNodeLayout<V, M, Ref, const B: usize>
+where
+    V: Semigroup + Clone,
+{
+    Empty,
+    Block(SegBlock<V, B>),
+    Branch(SegBranchLayout<V, M, Ref>),
+}
+
+#[allow(dead_code)]
+enum SegBlockNodeLayout<V, M, Ref, const B: usize>
+where
+    V: Semigroup + Clone,
+{
+    Empty,
+    Block(SegBlock<V, B>),
+    // 长度为 0 的数组不贡献载荷大小，但会保留分支载荷的对齐要求。
+    Branch([MaybeUninit<SegBranchLayout<V, M, Ref>>; 0]),
+}
+
+/// 按目标字节数估算 `SegBlock<V, B>` 能容纳多少个叶值。
 ///
-/// 如果 modifier 或引用类型很大，分支节点可能已经超过一个 cache line；这时叶块
-/// 至少按分支节点的大小来估算，避免叶块比相邻分支小太多。
-pub const fn seg_leaf_block_capacity_for_ref_bytes<V, M, Ref>(target_bytes: usize) -> usize {
-    let branch = seg_branch_payload_bytes::<V, M, Ref>();
-    let target = if target_bytes < branch {
-        branch
+/// 这是线段树唯一保留的容量策略：用实际 `SegBlock` 布局估算叶块增长量，同时参考
+/// `SegNode::Branch` 的实际大小，让叶子节点和相邻分支节点的大小尽量接近。bench
+/// 显示这个策略在随机更新上略优于只把 `SegBlock` 塞进一个 cache line 的策略。
+///
+/// `M` 和 `Ref` 不在 `SegBlock` 内；它们只用于估算分支节点大小。也就是说，`M`
+/// 不改变叶块的字段布局，但会影响“叶块应该做多大才和分支节点匹配”这个决策。
+pub const fn seg_block_capacity_for_bytes<V, M, Ref>(target_bytes: usize) -> usize
+where
+    V: Semigroup + Clone,
+    M: Clone,
+{
+    let branch_size = size_of::<SegNodeLayout<V, M, Ref, 0>>();
+    let target = if target_bytes < branch_size {
+        branch_size
     } else {
         target_bytes
     };
-    seg_leaf_block_capacity_for_bytes::<V>(target)
-}
 
-/// 结合 `V/M/Ref` 的大小给出一个偏保守的叶块容量。
-///
-/// 这里让叶块目标大小至少覆盖一个 cache line，并且略大于相邻分支节点。这样在
-/// modifier 较大时不会把叶块算得过小；在常见小 modifier 场景下仍然保持较紧凑的块。
-pub const fn seg_leaf_block_capacity_for_ref<V, M, Ref>() -> usize {
-    let branch = seg_branch_payload_bytes::<V, M, Ref>() + SEG_TREE_CACHE_LINE_BYTES / 4;
-    let target = if branch < SEG_TREE_CACHE_LINE_BYTES {
-        SEG_TREE_CACHE_LINE_BYTES
-    } else {
-        branch
-    };
-    seg_leaf_block_capacity_for_bytes::<V>(target)
+    capacity_for_linear_size(
+        size_of::<SegBlockNodeLayout<V, M, Ref, 0>>(),
+        size_of::<SegBlockNodeLayout<V, M, Ref, 1>>(),
+        target,
+    )
 }
 
 /// 线段树懒标记。
@@ -80,10 +99,31 @@ pub const fn seg_leaf_block_capacity_for_ref<V, M, Ref>() -> usize {
 pub trait Applier<V: Semigroup> {
     fn apply(&self, to: &mut V);
 
-    /// 持久化路径仍需要得到一个新值；这里集中保留“克隆后原址应用”的默认实现。
+    /// 非原址更新和查询下推仍需要得到一个新值；这里集中保留
+    /// “克隆后原址应用”的默认实现。
     fn applied(&self, mut to: V) -> V {
         self.apply(&mut to);
         to
+    }
+
+    /// 判断这个懒标记是否可能改变某个节点代表的整个区间。
+    ///
+    /// 默认返回 true，表示不做剪枝。覆写时必须保证：返回 false 意味着把该懒标记
+    /// 应用到这个节点覆盖的每一个元素上都不会改变任何元素；仅仅“聚合值不变”不够。
+    /// 例如颜色集合 bitmask 可以判断“区间里完全没有会被替换的颜色”，但只保存右端
+    /// 颜色的 assign-like monoid 不能安全剪枝，因为区间内部元素仍可能被改变。
+    fn affects(&self, _value: &V) -> bool {
+        true
+    }
+
+    /// 对叶块做批量应用。
+    ///
+    /// 默认逐个调用 `apply`。需要 SIMD、查表或其它数据并行优化时可以覆写这个方法；
+    /// 这是执行优化，不改变 `Applier` 的代数语义。
+    fn apply_slice(&self, to: &mut [V]) {
+        for value in to {
+            self.apply(value);
+        }
     }
 }
 
@@ -93,6 +133,11 @@ impl<A: Semigroup, B: Semigroup, MA: Applier<A>, MB: Applier<B>> Applier<(A, B)>
         ma.apply(a);
         mb.apply(b);
     }
+
+    fn affects(&self, (a, b): &(A, B)) -> bool {
+        let (ma, mb) = self;
+        ma.affects(a) || mb.affects(b)
+    }
 }
 
 impl<A: Semigroup, M: Applier<A>> Applier<A> for Option<M> {
@@ -101,13 +146,26 @@ impl<A: Semigroup, M: Applier<A>> Applier<A> for Option<M> {
             f.apply(to);
         }
     }
+
+    fn affects(&self, value: &A) -> bool {
+        match self {
+            Some(f) => f.affects(value),
+            None => false,
+        }
+    }
+
+    fn apply_slice(&self, to: &mut [A]) {
+        if let Some(f) = self {
+            f.apply_slice(to);
+        }
+    }
 }
 
 type SegRef<V, M, const B: usize, R> = <R as RefStore<SegNode<V, M, B, R>>>::Ref;
-type StoreNode<V, M, F, const B: usize> = SegNode<V, M, B, SegTreeStore<V, M, F, B>>;
-type InnerStore<V, M, F, const B: usize> = <F as RefStoreFactory>::Store<StoreNode<V, M, F, B>>;
+type StoreNode<V, M, const B: usize, F> = SegNode<V, M, B, SegTreeStore<V, M, B, F>>;
+type InnerStore<V, M, const B: usize, F> = <F as RefStoreFactory>::Store<StoreNode<V, M, B, F>>;
 type BaseArenaSegTreeStore<'base, V, M, const B: usize> =
-    SegTreeStore<V, M, ArenaStoreFactory<'base>, B>;
+    SegTreeStore<V, M, B, ArenaStoreFactory<'base>>;
 
 pub type LayeredArenaSegTreeStore<
     'store,
@@ -119,13 +177,13 @@ pub type LayeredArenaSegTreeStore<
 > = SegTreeStore<
     V,
     M,
+    B,
     LayeredArenaStoreFactory<
         'store,
         'scratch,
         BaseArenaSegTreeStore<'base, V, M, B>,
         SegTreeLayerMapper<'store, 'base, 'scratch, V, M, B>,
     >,
-    B,
 >;
 
 type SegTreeLayerMarker<'store, 'base, 'scratch, V, M, const B: usize> =
@@ -140,22 +198,22 @@ where
     marker: SegTreeLayerMarker<'store, 'base, 'scratch, V, M, B>,
 }
 
-pub struct SegTreeStore<V, M, F = RcStoreFactory, const B: usize = DEFAULT_SEG_LEAF_BLOCK_CAPACITY>
+pub struct SegTreeStore<V, M, const B: usize = DEFAULT_SEG_LEAF_BLOCK_CAPACITY, F = RcStoreFactory>
 where
     V: Semigroup + Clone,
     M: Clone,
     F: RefStoreFactory,
-    InnerStore<V, M, F, B>: RefStore<StoreNode<V, M, F, B>>,
+    InnerStore<V, M, B, F>: RefStore<StoreNode<V, M, B, F>>,
 {
-    nodes: InnerStore<V, M, F, B>,
+    nodes: InnerStore<V, M, B, F>,
 }
 
-impl<V, M, F, const B: usize> SegTreeStore<V, M, F, B>
+impl<V, M, const B: usize, F> SegTreeStore<V, M, B, F>
 where
     V: Semigroup + Clone,
     M: Clone,
     F: RefStoreFactory,
-    InnerStore<V, M, F, B>: RefStore<StoreNode<V, M, F, B>>,
+    InnerStore<V, M, B, F>: RefStore<StoreNode<V, M, B, F>>,
 {
     pub fn new(factory: F) -> Self {
         Self {
@@ -164,19 +222,19 @@ where
     }
 }
 
-impl<V, M, F, const B: usize> Default for SegTreeStore<V, M, F, B>
+impl<V, M, const B: usize, F> Default for SegTreeStore<V, M, B, F>
 where
     V: Semigroup + Clone,
     M: Clone,
     F: RefStoreFactory + Default,
-    InnerStore<V, M, F, B>: RefStore<StoreNode<V, M, F, B>>,
+    InnerStore<V, M, B, F>: RefStore<StoreNode<V, M, B, F>>,
 {
     fn default() -> Self {
         Self::new(F::default())
     }
 }
 
-impl<'base, V, M, const B: usize> SegTreeStore<V, M, ArenaStoreFactory<'base>, B>
+impl<'base, V, M, const B: usize> SegTreeStore<V, M, B, ArenaStoreFactory<'base>>
 where
     V: Semigroup + Clone,
     M: Clone,
@@ -199,7 +257,7 @@ where
 {
     pub fn from_base(
         &self,
-        tree: &SegTree<V, M, B, SegTreeStore<V, M, ArenaStoreFactory<'base>, B>>,
+        tree: &SegTree<V, M, B, SegTreeStore<V, M, B, ArenaStoreFactory<'base>>>,
     ) -> SegTree<V, M, B, Self> {
         tree.map_refs(&|reference| LayeredRef::Base(*reference))
     }
@@ -212,53 +270,51 @@ where
     V: Semigroup + Clone,
     M: Clone,
 {
-    type Source = SegNode<V, M, B, SegTreeStore<V, M, ArenaStoreFactory<'base>, B>>;
+    type Source = SegNode<V, M, B, SegTreeStore<V, M, B, ArenaStoreFactory<'base>>>;
+}
 
-    fn map_ref(
-        value: &Self::Source,
-    ) -> SegNode<V, M, B, LayeredArenaSegTreeStore<'store, 'base, 'scratch, V, M, B>> {
+impl<'store, 'base, 'scratch, V, M, const B: usize>
+    From<&SegNode<V, M, B, SegTreeStore<V, M, B, ArenaStoreFactory<'base>>>>
+    for SegNode<V, M, B, LayeredArenaSegTreeStore<'store, 'base, 'scratch, V, M, B>>
+where
+    V: Semigroup + Clone,
+    M: Clone,
+{
+    fn from(value: &SegNode<V, M, B, SegTreeStore<V, M, B, ArenaStoreFactory<'base>>>) -> Self {
         value.map_refs(&|reference| LayeredRef::Base(*reference))
     }
 }
 
-impl<V, M, S, const B: usize> RefStore<StoreNode<V, M, S, B>> for SegTreeStore<V, M, S, B>
+impl<V, M, const B: usize, S> RefStore<StoreNode<V, M, B, S>> for SegTreeStore<V, M, B, S>
 where
     V: Semigroup + Clone,
     M: Clone,
     S: RefStoreFactory,
-    InnerStore<V, M, S, B>: RefStore<StoreNode<V, M, S, B>>,
+    InnerStore<V, M, B, S>: RefStore<StoreNode<V, M, B, S>>,
 {
-    type Ref = <InnerStore<V, M, S, B> as RefStore<StoreNode<V, M, S, B>>>::Ref;
+    type Ref = <InnerStore<V, M, B, S> as RefStore<StoreNode<V, M, B, S>>>::Ref;
 
-    fn alloc(&mut self, value: StoreNode<V, M, S, B>) -> Self::Ref {
+    fn alloc(&mut self, value: StoreNode<V, M, B, S>) -> Self::Ref {
         self.nodes.alloc(value)
     }
 
     fn with_ref<T, C>(&self, reference: &Self::Ref, f: C) -> T
     where
-        C: FnOnce(&StoreNode<V, M, S, B>) -> T,
+        C: FnOnce(&StoreNode<V, M, B, S>) -> T,
     {
         self.nodes.with_ref(reference, f)
     }
 }
 
-impl<V, M, S, const B: usize> RefStoreMut<StoreNode<V, M, S, B>> for SegTreeStore<V, M, S, B>
+impl<V, M, const B: usize, S> RefStoreMut<StoreNode<V, M, B, S>> for SegTreeStore<V, M, B, S>
 where
     V: Semigroup + Clone,
     M: Clone,
     S: RefStoreFactory,
-    InnerStore<V, M, S, B>: RefStoreMut<StoreNode<V, M, S, B>>,
+    InnerStore<V, M, B, S>: RefStoreMut<StoreNode<V, M, B, S>>,
 {
-    fn set_ref(&mut self, reference: &Self::Ref, value: SegNode<V, M, B, Self>) {
-        self.nodes.set_ref(reference, value);
-    }
-
-    fn replace_ref(
-        &mut self,
-        reference: &Self::Ref,
-        value: SegNode<V, M, B, Self>,
-    ) -> SegNode<V, M, B, Self> {
-        self.nodes.replace_ref(reference, value)
+    fn ref_mut(&mut self, reference: &Self::Ref) -> &mut SegNode<V, M, B, Self> {
+        self.nodes.ref_mut(reference)
     }
 }
 
@@ -277,7 +333,7 @@ pub struct Iter<
     V,
     M,
     const B: usize = DEFAULT_SEG_LEAF_BLOCK_CAPACITY,
-    R = SegTreeStore<V, M, RcStoreFactory, B>,
+    R = SegTreeStore<V, M, B, RcStoreFactory>,
 > where
     V: Semigroup + Clone,
     M: Clone,
@@ -334,7 +390,7 @@ pub struct SegTree<
     V,
     M,
     const B: usize = DEFAULT_SEG_LEAF_BLOCK_CAPACITY,
-    R = SegTreeStore<V, M, RcStoreFactory, B>,
+    R = SegTreeStore<V, M, B, RcStoreFactory>,
 > where
     V: Semigroup + Clone,
     M: Clone,
@@ -357,7 +413,7 @@ pub enum SegNode<
     V,
     M,
     const B: usize = DEFAULT_SEG_LEAF_BLOCK_CAPACITY,
-    R = SegTreeStore<V, M, RcStoreFactory, B>,
+    R = SegTreeStore<V, M, B, RcStoreFactory>,
 > where
     V: Semigroup + Clone,
     M: Clone,
@@ -468,19 +524,8 @@ impl<V, const N: usize> SegBlock<V, N>
 where
     V: Semigroup + Clone,
 {
-    fn as_slice(&self, size: usize) -> &[V] {
-        debug_assert!(size <= N);
-        &self.items[..size]
-    }
-
-    fn as_mut_slice(&mut self, size: usize) -> &mut [V] {
-        debug_assert!(size <= N);
-        &mut self.items[..size]
-    }
-
-    fn range_bounds(&self, size: usize, range: Range<usize>) -> Range<usize> {
-        debug_assert!(size <= N);
-        min(range.start, size)..min(range.end, size)
+    fn range_bounds(range: Range<usize>) -> Range<usize> {
+        min(range.start, N)..min(range.end, N)
     }
 }
 
@@ -508,8 +553,7 @@ where
         Self { value, items }
     }
 
-    fn all(&self, size: usize) -> V {
-        debug_assert!(size <= N);
+    fn all(&self) -> V {
         self.value.clone()
     }
 }
@@ -527,16 +571,14 @@ impl<V, const N: usize> SegBlock<V, N>
 where
     V: Monoid + Clone,
 {
-    fn apply_all_mut<M>(&mut self, size: usize, m: &M)
+    fn apply_all_mut<M>(&mut self, m: &M)
     where
-        M: Clone + Monoid + Applier<V>,
+        M: Applier<V> + Monoid + Clone,
     {
-        if m.is_empty() {
+        if m.is_empty() || !m.affects(&self.value) {
             return;
         }
-        for value in self.as_mut_slice(size) {
-            m.apply(value);
-        }
+        m.apply_slice(&mut self.items[..N]);
         m.apply(&mut self.value);
     }
 }
@@ -557,74 +599,46 @@ impl<V, const N: usize> SegBlock<V, N>
 where
     V: Monoid + Clone,
 {
-    fn query(&self, size: usize, range: Range<usize>) -> V {
-        let range = self.range_bounds(size, range);
+    fn query(&self, range: Range<usize>) -> V {
         if range.is_empty() {
             return V::empty();
         }
-        if range.start == 0 && range.end == size {
-            return self.all(size);
+        if range.start == 0 && range.end >= N {
+            return self.all();
         }
-        self.as_slice(size)[range]
+        self.items[Self::range_bounds(range)]
             .iter()
             .cloned()
             .reduce(Semigroup::merge)
             .unwrap_or_else(V::empty)
     }
 
-    fn apply_mut<M>(&mut self, size: usize, range: Range<usize>, m: &M)
+    fn apply_mut<M>(&mut self, range: Range<usize>, m: &M)
     where
         M: Applier<V> + Monoid + Clone,
     {
-        if m.is_empty() {
+        if m.is_empty() || range.is_empty() || !m.affects(&self.value) {
             return;
         }
-        let range = self.range_bounds(size, range);
-        if range.is_empty() {
-            return;
-        }
-        if range.start == 0 && range.end == size {
-            self.apply_all_mut(size, m);
+        if range.start == 0 && range.end >= N {
+            self.apply_all_mut(m);
             return;
         }
 
-        let slice = self.as_mut_slice(size);
-        let (before, rest) = slice.split_at_mut(range.start);
-        let (middle, after) = rest.split_at_mut(range.end - range.start);
-        let mut result: Option<V> = None;
-
-        for value in before {
-            let value = value.clone();
-            result = Some(match result {
-                Some(result) => result.merge(value),
-                None => value,
-            });
-        }
-        for value in middle {
-            m.apply(value);
-            let value = value.clone();
-            result = Some(match result {
-                Some(result) => result.merge(value),
-                None => value,
-            });
-        }
-        for value in after {
-            let value = value.clone();
-            result = Some(match result {
-                Some(result) => result.merge(value),
-                None => value,
-            });
-        }
-
-        let value = result.unwrap_or_else(V::empty);
-        self.value = value;
+        m.apply_slice(&mut self.items[Self::range_bounds(range)]);
+        self.value = self
+            .items
+            .iter()
+            .cloned()
+            .reduce(Semigroup::merge)
+            .unwrap_or_else(V::empty);
     }
 }
 
 impl<V, M, const B: usize, R> SegTree<V, M, B, R>
 where
     V: Monoid + Clone,
-    M: Applier<V> + Monoid + Clone,
+    M: Monoid + Clone,
     R: RefStore<SegNode<V, M, B, R>> + Default,
 {
     pub fn build<F: Fn(usize) -> V + Clone>(len: usize, init: F) -> Self {
@@ -636,7 +650,7 @@ where
 impl<V, M, const B: usize, R> SegTree<V, M, B, R>
 where
     V: Monoid + Clone,
-    M: Applier<V> + Monoid + Clone,
+    M: Monoid + Clone,
     R: RefStore<SegNode<V, M, B, R>>,
 {
     pub fn build_in<F: Fn(usize) -> V + Clone>(refs: &mut R, len: usize, init: F) -> Self {
@@ -644,7 +658,14 @@ where
         let root = SegNode::build_inner(refs, 0, len, init);
         Self { len, root }
     }
+}
 
+impl<V, M, const B: usize, R> SegTree<V, M, B, R>
+where
+    V: Monoid + Clone,
+    M: Applier<V> + Monoid + Clone,
+    R: RefStore<SegNode<V, M, B, R>>,
+{
     pub fn iter<'a>(&self, refs: &'a R) -> Iter<'a, V, M, B, R> {
         Iter {
             stack: vec![IterEntry::PendingTree(
@@ -659,7 +680,14 @@ where
     pub fn query(&self, refs: &R, range: Range<usize>) -> V {
         self.root.query(refs, self.len, range)
     }
+}
 
+impl<V, M, const B: usize, R> SegTree<V, M, B, R>
+where
+    V: Monoid + Clone,
+    M: Applier<V> + Monoid + Clone,
+    R: RefStore<SegNode<V, M, B, R>>,
+{
     pub fn apply(&self, refs: &mut R, range: Range<usize>, m: &M) -> Self {
         Self {
             len: self.len,
@@ -685,10 +713,10 @@ where
     M: Clone,
     R: RefStore<SegNode<V, M, B, R>>,
 {
-    fn all(&self, size: usize) -> V {
+    fn all(&self) -> V {
         match self {
             Self::Empty => V::empty(),
-            Self::Block(block) => block.all(size),
+            Self::Block(block) => block.all(),
             Self::Branch { value, .. } => value.clone(),
         }
     }
@@ -697,21 +725,24 @@ where
 impl<V, M, const B: usize, R> SegNode<V, M, B, R>
 where
     V: Monoid + Clone,
-    M: Clone + Monoid + Applier<V>,
+    M: Applier<V> + Monoid + Clone,
     R: RefStore<SegNode<V, M, B, R>>,
 {
-    fn apply_all_mut(&mut self, size: usize, m: &M) {
+    fn apply_all_mut(&mut self, m: &M) {
         if m.is_empty() {
             return;
         }
         match self {
             Self::Empty => {}
-            Self::Block(block) => block.apply_all_mut(size, m),
+            Self::Block(block) => block.apply_all_mut(m),
             Self::Branch {
                 modifier, value, ..
             } => {
+                if !m.affects(value) {
+                    return;
+                }
                 m.apply(value);
-                *modifier = m.clone().merge(modifier.clone());
+                modifier.prepend_assign(m);
             }
         }
     }
@@ -737,7 +768,7 @@ where
             let left_size = Self::split_left_size(len);
             let left = Self::build_inner(refs, offset, left_size, init.clone());
             let right = Self::build_inner(refs, offset + left_size, len - left_size, init);
-            let value = left.all(left_size).merge(right.all(len - left_size));
+            let value = left.all().merge(right.all());
 
             Self::Branch {
                 left_size,
@@ -768,7 +799,7 @@ where
     fn query(&self, refs: &R, size: usize, range: Range<usize>) -> V {
         match self {
             Self::Empty => V::empty(),
-            Self::Block(block) => block.query(size, range),
+            Self::Block(block) => block.query(range),
             Self::Branch {
                 left_size,
                 modifier,
@@ -804,7 +835,14 @@ where
             }
         }
     }
+}
 
+impl<V, M, const B: usize, R> SegNode<V, M, B, R>
+where
+    V: Monoid + Clone,
+    M: Applier<V> + Monoid + Clone,
+    R: RefStore<SegNode<V, M, B, R>>,
+{
     /// Apply a modifier to a SegTree.
     ///
     /// # Arguments
@@ -823,7 +861,7 @@ where
         }
         match self {
             Self::Empty => {}
-            Self::Block(block) => block.apply_mut(size, range, m),
+            Self::Block(block) => block.apply_mut(range, m),
             Self::Branch {
                 left_size,
                 modifier,
@@ -831,9 +869,12 @@ where
                 left,
                 right,
             } => {
+                if !m.affects(value) {
+                    return;
+                }
                 if range.start == 0 && size <= range.end {
                     m.apply(value);
-                    *modifier = m.clone().merge(modifier.clone());
+                    modifier.prepend_assign(m);
                     return;
                 }
 
@@ -849,29 +890,29 @@ where
                 let (left_ref, left_value) = if push_modifier || left_range.is_some() {
                     let mut left_node = refs.with_ref(&old_left, |node| node.clone());
                     if push_modifier {
-                        left_node.apply_all_mut(mid, modifier);
+                        left_node.apply_all_mut(modifier);
                     }
                     if let Some(range) = left_range {
                         left_node.apply_owned_mut(refs, mid, range, m);
                     }
-                    let value = left_node.all(mid);
+                    let value = left_node.all();
                     (refs.alloc(left_node), value)
                 } else {
-                    (old_left, refs.with_ref(left, |node| node.all(mid)))
+                    (old_left, refs.with_ref(left, |node| node.all()))
                 };
 
                 let (right_ref, right_value) = if push_modifier || right_range.is_some() {
                     let mut right_node = refs.with_ref(&old_right, |node| node.clone());
                     if push_modifier {
-                        right_node.apply_all_mut(right_size, modifier);
+                        right_node.apply_all_mut(modifier);
                     }
                     if let Some(range) = right_range {
                         right_node.apply_owned_mut(refs, right_size, range, m);
                     }
-                    let value = right_node.all(right_size);
+                    let value = right_node.all();
                     (refs.alloc(right_node), value)
                 } else {
-                    (old_right, refs.with_ref(right, |node| node.all(right_size)))
+                    (old_right, refs.with_ref(right, |node| node.all()))
                 };
 
                 *modifier = M::empty();
@@ -886,12 +927,12 @@ where
     where
         R: RefStoreMut<SegNode<V, M, B, R>>,
     {
-        if m.is_empty() {
+        if m.is_empty() || range.is_empty() {
             return;
         }
         match self {
             Self::Empty => {}
-            Self::Block(block) => block.apply_mut(size, range, m),
+            Self::Block(block) => block.apply_mut(range, m),
             Self::Branch {
                 left_size,
                 modifier,
@@ -899,30 +940,39 @@ where
                 left,
                 right,
             } => {
+                if !m.affects(value) {
+                    return;
+                }
                 if range.start == 0 && size <= range.end {
                     m.apply(value);
-                    *modifier = m.clone().merge(modifier.clone());
-                } else {
-                    let mid = *left_size;
-                    let left_ref = left.clone();
-                    let right_ref = right.clone();
-                    let push_modifier = !modifier.is_empty();
+                    modifier.prepend_assign(m);
+                    return;
+                }
 
-                    let mut left_node = refs.replace_ref(&left_ref, Self::Empty);
+                let mid = *left_size;
+                let right_size = size - mid;
+                let push_modifier = !modifier.is_empty();
+                let left_hit = range.start < mid;
+                let right_hit = mid < range.end;
+                let left_ref = left.clone();
+                let right_ref = right.clone();
+
+                if push_modifier || (left_hit && right_hit) {
+                    let mut left_node = std::mem::replace(refs.ref_mut(&left_ref), Self::Empty);
                     if push_modifier {
-                        left_node.apply_all_mut(mid, modifier);
+                        left_node.apply_all_mut(modifier);
                     }
-                    if range.start < mid {
+                    if left_hit {
                         left_node.apply_mut(refs, mid, range.start..min(range.end, mid), m);
                     }
-                    refs.set_ref(&left_ref, left_node);
+                    let left_value = left_node.all();
+                    *refs.ref_mut(&left_ref) = left_node;
 
-                    let right_size = size - mid;
-                    let mut right_node = refs.replace_ref(&right_ref, Self::Empty);
+                    let mut right_node = std::mem::replace(refs.ref_mut(&right_ref), Self::Empty);
                     if push_modifier {
-                        right_node.apply_all_mut(right_size, modifier);
+                        right_node.apply_all_mut(modifier);
                     }
-                    if mid < range.end {
+                    if right_hit {
                         right_node.apply_mut(
                             refs,
                             right_size,
@@ -930,11 +980,31 @@ where
                             m,
                         );
                     }
-                    refs.set_ref(&right_ref, right_node);
+                    let right_value = right_node.all();
+                    *refs.ref_mut(&right_ref) = right_node;
 
-                    let left_value = refs.with_ref(&left_ref, |node| node.all(mid));
-                    let right_value = refs.with_ref(&right_ref, |node| node.all(size - mid));
                     *modifier = M::empty();
+                    *value = left_value.merge(right_value);
+                } else if left_hit {
+                    let mut left_node = std::mem::replace(refs.ref_mut(&left_ref), Self::Empty);
+                    left_node.apply_mut(refs, mid, range.start..min(range.end, mid), m);
+                    let left_value = left_node.all();
+                    *refs.ref_mut(&left_ref) = left_node;
+
+                    let right_value = refs.with_ref(&right_ref, |node| node.all());
+                    *value = left_value.merge(right_value);
+                } else if right_hit {
+                    let mut right_node = std::mem::replace(refs.ref_mut(&right_ref), Self::Empty);
+                    right_node.apply_mut(
+                        refs,
+                        right_size,
+                        max(range.start, mid) - mid..range.end - mid,
+                        m,
+                    );
+                    let right_value = right_node.all();
+                    *refs.ref_mut(&right_ref) = right_node;
+
+                    let left_value = refs.with_ref(&left_ref, |node| node.all());
                     *value = left_value.merge(right_value);
                 }
             }

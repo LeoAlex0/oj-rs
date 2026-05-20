@@ -37,6 +37,7 @@ cargo oj-pack luogu_p3372 > out.rs
 cargo oj-pack --list
 cargo oj-pack --minify luogu_p3372 > out.rs
 cargo oj-pack --no-check luogu_p3372
+cargo oj-pack --no-prune-impl-items luogu_p3372
 cargo oj-pack --max-bytes 65536 luogu_p3372 > out.rs
 cargo oj-pack completions zsh > _oj-pack
 ```
@@ -48,6 +49,7 @@ cargo oj-pack completions zsh > _oj-pack
 - 将 `solution::...` 路径改写为单文件内可用的 `crate::...` 路径；
 - 移除测试专用 item 和文档属性；
 - 执行保守的 item-level dead code elimination；
+- 自动裁剪保留 impl block 中未实际使用的固有方法；
 - 默认输出经过格式化的可读源码；
 - 使用 `rustc --emit=metadata` 校验生成源码。
 

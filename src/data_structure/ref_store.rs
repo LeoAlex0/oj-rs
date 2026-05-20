@@ -10,8 +10,7 @@ pub trait RefStore<T> {
 }
 
 pub trait RefStoreMut<T>: RefStore<T> {
-    fn set_ref(&mut self, reference: &Self::Ref, value: T);
-    fn replace_ref(&mut self, reference: &Self::Ref, value: T) -> T;
+    fn ref_mut(&mut self, reference: &Self::Ref) -> &mut T;
 }
 
 pub trait RefStoreFactory {
@@ -22,8 +21,6 @@ pub trait RefStoreFactory {
 
 pub trait RefMapper<T> {
     type Source;
-
-    fn map_ref(value: &Self::Source) -> T;
 }
 
 pub struct LayeredStore<'base, Base, Scratch, Mapper> {
@@ -167,6 +164,7 @@ where
     Base: RefStore<Mapper::Source>,
     Scratch: RefStore<T>,
     Mapper: RefMapper<T>,
+    for<'a> T: From<&'a Mapper::Source>,
 {
     type Ref = LayeredRef<<Base as RefStore<Mapper::Source>>::Ref, <Scratch as RefStore<T>>::Ref>;
 
@@ -182,7 +180,7 @@ where
     {
         match reference {
             LayeredRef::Base(reference) => self.base.with_ref(reference, |value| {
-                let mapped = Mapper::map_ref(value);
+                let mapped = T::from(value);
                 f(&mapped)
             }),
             LayeredRef::Scratch(reference) => self.scratch.with_ref(reference, f),
@@ -197,6 +195,19 @@ pub struct Arena<'id, T> {
     brand: Brand<'id>,
 }
 
+#[repr(align(64))]
+struct CacheAligned<T>(T);
+
+/// 每个槽位都从 64 字节边界开始的 arena。
+///
+/// 普通 `Vec<T>` 只保证 `align_of::<T>()`；如果一个节点大小接近 cache line，
+/// 但起始地址没有 64B 对齐，节点可能稳定跨越两条 cache line。这个 arena 用一层
+/// `repr(align(64))` 包装节点，让适合 cacheline 打包的数据结构可以显式选择更强对齐。
+pub struct AlignedArena<'id, T> {
+    storage: Vec<CacheAligned<T>>,
+    brand: Brand<'id>,
+}
+
 pub struct ConstArena<'id, T, const N: usize> {
     storage: Box<[MaybeUninit<T>; N]>,
     len: usize,
@@ -204,6 +215,11 @@ pub struct ConstArena<'id, T, const N: usize> {
 }
 
 pub struct ArenaStoreFactory<'id> {
+    capacity: usize,
+    brand: Brand<'id>,
+}
+
+pub struct AlignedArenaStoreFactory<'id> {
     capacity: usize,
     brand: Brand<'id>,
 }
@@ -224,6 +240,18 @@ impl ArenaStoreFactory<'_> {
         F: for<'id> FnOnce(ArenaStoreFactory<'id>) -> T,
     {
         f(ArenaStoreFactory {
+            capacity,
+            brand: PhantomData,
+        })
+    }
+}
+
+impl AlignedArenaStoreFactory<'_> {
+    pub fn scoped<T, F>(capacity: usize, f: F) -> T
+    where
+        F: for<'id> FnOnce(AlignedArenaStoreFactory<'id>) -> T,
+    {
+        f(AlignedArenaStoreFactory {
             capacity,
             brand: PhantomData,
         })
@@ -272,6 +300,17 @@ impl<'id> RefStoreFactory for ArenaStoreFactory<'id> {
     }
 }
 
+impl<'id> RefStoreFactory for AlignedArenaStoreFactory<'id> {
+    type Store<T> = AlignedArena<'id, T>;
+
+    fn store<T>(&self) -> Self::Store<T> {
+        AlignedArena {
+            storage: Vec::with_capacity(self.capacity),
+            brand: self.brand,
+        }
+    }
+}
+
 impl<'id, const N: usize> RefStoreFactory for ConstArenaStoreFactory<'id, N> {
     type Store<T> = ConstArena<'id, T, N>;
 
@@ -303,12 +342,38 @@ impl<'id, T> RefStore<T> for Arena<'id, T> {
 }
 
 impl<'id, T> RefStoreMut<T> for Arena<'id, T> {
-    fn set_ref(&mut self, reference: &Self::Ref, value: T) {
-        self.storage[reference.index] = value;
+    #[inline]
+    fn ref_mut(&mut self, reference: &Self::Ref) -> &mut T {
+        &mut self.storage[reference.index]
+    }
+}
+
+impl<'id, T> RefStore<T> for AlignedArena<'id, T> {
+    type Ref = ArenaRef<'id>;
+
+    #[inline]
+    fn alloc(&mut self, value: T) -> Self::Ref {
+        let index = self.storage.len();
+        self.storage.push(CacheAligned(value));
+        ArenaRef {
+            index,
+            brand: self.brand,
+        }
     }
 
-    fn replace_ref(&mut self, reference: &Self::Ref, value: T) -> T {
-        std::mem::replace(&mut self.storage[reference.index], value)
+    #[inline]
+    fn with_ref<U, F>(&self, reference: &Self::Ref, f: F) -> U
+    where
+        F: FnOnce(&T) -> U,
+    {
+        f(&self.storage[reference.index].0)
+    }
+}
+
+impl<'id, T> RefStoreMut<T> for AlignedArena<'id, T> {
+    #[inline]
+    fn ref_mut(&mut self, reference: &Self::Ref) -> &mut T {
+        &mut self.storage[reference.index].0
     }
 }
 
@@ -343,26 +408,15 @@ impl<'id, T, const N: usize> RefStore<T> for ConstArena<'id, T, N> {
 }
 
 impl<'id, T, const N: usize> RefStoreMut<T> for ConstArena<'id, T, N> {
-    fn set_ref(&mut self, reference: &Self::Ref, value: T) {
+    #[inline]
+    fn ref_mut(&mut self, reference: &Self::Ref) -> &mut T {
         assert!(
             reference.index < self.len,
             "const arena reference points outside initialized storage"
         );
-        // SAFETY: 同上，目标槽位已经初始化；先析构旧值，再原址写入新值。
-        unsafe {
-            self.storage[reference.index].assume_init_drop();
-        }
-        self.storage[reference.index].write(value);
-    }
-
-    fn replace_ref(&mut self, reference: &Self::Ref, value: T) -> T {
-        assert!(
-            reference.index < self.len,
-            "const arena reference points outside initialized storage"
-        );
-        // SAFETY: `alloc` 只会返回小于 `len` 的下标，且该槽位已经初始化。
-        // `replace` 在原位置写入新值，并把旧值按普通 Rust 值移出交给调用方管理。
-        unsafe { std::mem::replace(self.storage[reference.index].assume_init_mut(), value) }
+        // SAFETY: `alloc` 只会返回小于 `len` 的下标，且 `[0, len)` 内的槽位都已初始化。
+        // `ArenaRef` 的 brand 防止不同 scoped arena 之间的引用混用。
+        unsafe { self.storage[reference.index].assume_init_mut() }
     }
 }
 

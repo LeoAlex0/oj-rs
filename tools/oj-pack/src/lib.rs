@@ -20,6 +20,7 @@ pub struct PackOptions {
     pub minify: bool,
     pub max_bytes: Option<usize>,
     pub warn_bytes: usize,
+    pub prune_impl_items: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -108,12 +109,16 @@ pub fn pack_project(
     output_items.extend(bin_file.items);
 
     let tokens = quote! { #(#output_items)* };
+    let mut output_file = syn::parse2::<File>(tokens)?;
+    if options.prune_impl_items {
+        prune_unused_fine_items(&mut output_file);
+    }
     let output = if options.minify {
-        let mut s = minify(tokens);
+        let mut s = minify(output_file.to_token_stream());
         s.push('\n');
         s
     } else {
-        prettyplease::unparse(&syn::parse2::<File>(tokens)?)
+        prettyplease::unparse(&output_file)
     };
 
     if options.check {
@@ -1163,6 +1168,256 @@ fn is_pub_use(item: &ItemUse) -> bool {
     matches!(item.vis, syn::Visibility::Public(_))
 }
 
+#[derive(Debug)]
+struct FinePruneCandidate {
+    name: String,
+    refs: HashSet<String>,
+}
+
+fn prune_unused_fine_items(file: &mut File) {
+    let mut candidates = Vec::new();
+    collect_fine_prune_candidates(&file.items, &mut candidates);
+    if candidates.is_empty() {
+        return;
+    }
+
+    let candidate_names = candidates
+        .iter()
+        .map(|candidate| candidate.name.clone())
+        .collect::<HashSet<_>>();
+    let mut name_index: HashMap<String, Vec<usize>> = HashMap::new();
+    for (key, candidate) in candidates.iter().enumerate() {
+        name_index
+            .entry(candidate.name.clone())
+            .or_default()
+            .push(key);
+    }
+
+    let mut seeds = HashSet::new();
+    collect_non_candidate_fine_prune_idents(&file.items, &mut seeds);
+
+    let mut kept = BTreeSet::new();
+    let mut queued = HashSet::new();
+    let mut work = VecDeque::new();
+    for name in seeds.intersection(&candidate_names) {
+        if queued.insert(name.clone()) {
+            work.push_back(name.clone());
+        }
+    }
+
+    while let Some(name) = work.pop_front() {
+        if let Some(keys) = name_index.get(&name) {
+            for key in keys {
+                if !kept.insert(*key) {
+                    continue;
+                }
+                for dep in candidates[*key].refs.intersection(&candidate_names) {
+                    if queued.insert(dep.clone()) {
+                        work.push_back(dep.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    let mut next_key = 0;
+    let mut removed_item_consts = HashSet::new();
+    prune_fine_candidates_in_items(
+        &mut file.items,
+        &kept,
+        &mut next_key,
+        &mut removed_item_consts,
+    );
+    if !removed_item_consts.is_empty() {
+        prune_removed_const_uses_in_items(&mut file.items, &removed_item_consts);
+    }
+}
+
+fn collect_fine_prune_candidates(items: &[Item], out: &mut Vec<FinePruneCandidate>) {
+    for item in items {
+        match item {
+            Item::Mod(module) => {
+                if let Some((_, items)) = &module.content {
+                    collect_fine_prune_candidates(items, out);
+                }
+            }
+            Item::Impl(item) if item.trait_.is_none() => {
+                for inner in &item.items {
+                    if let Some(candidate) = impl_item_fine_prune_candidate(inner) {
+                        out.push(candidate);
+                    }
+                }
+            }
+            Item::Const(item) if item_const_can_be_pruned(item) => {
+                out.push(FinePruneCandidate {
+                    name: item.ident.to_string(),
+                    refs: collect_idents(item.to_token_stream()),
+                });
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_non_candidate_fine_prune_idents(items: &[Item], out: &mut HashSet<String>) {
+    for item in items {
+        match item {
+            Item::Mod(module) => {
+                if let Some((_, items)) = &module.content {
+                    collect_non_candidate_fine_prune_idents(items, out);
+                }
+            }
+            // `use`/`pub use` 只是路径引入，不代表被引入的名字真的在最终代码中使用。
+            // 真正使用时会在函数体、类型、const generic 等非候选代码里再次出现。
+            Item::Use(_) => {}
+            Item::Impl(item) if item.trait_.is_none() => {
+                let mut item = item.clone();
+                item.items
+                    .retain(|inner| impl_item_fine_prune_candidate(inner).is_none());
+                out.extend(collect_idents(item.to_token_stream()));
+            }
+            Item::Const(item) if item_const_can_be_pruned(item) => {}
+            _ => out.extend(collect_idents(item.to_token_stream())),
+        }
+    }
+}
+
+fn prune_fine_candidates_in_items(
+    items: &mut Vec<Item>,
+    kept: &BTreeSet<usize>,
+    next_key: &mut usize,
+    removed_item_consts: &mut HashSet<String>,
+) {
+    let mut out = Vec::with_capacity(items.len());
+    for item in std::mem::take(items) {
+        match item {
+            Item::Mod(mut module) => {
+                if let Some((_, items)) = &mut module.content {
+                    prune_fine_candidates_in_items(items, kept, next_key, removed_item_consts);
+                }
+                out.push(Item::Mod(module));
+            }
+            Item::Impl(mut item) if item.trait_.is_none() => {
+                item.items.retain(|inner| {
+                    if impl_item_fine_prune_candidate(inner).is_none() {
+                        return true;
+                    }
+                    let keep = kept.contains(&*next_key);
+                    *next_key += 1;
+                    keep
+                });
+                if !item.items.is_empty() {
+                    out.push(Item::Impl(item));
+                }
+            }
+            Item::Const(item) if item_const_can_be_pruned(&item) => {
+                let keep = kept.contains(&*next_key);
+                *next_key += 1;
+                if keep {
+                    out.push(Item::Const(item));
+                } else {
+                    removed_item_consts.insert(item.ident.to_string());
+                }
+            }
+            item => out.push(item),
+        }
+    }
+    *items = out;
+}
+
+fn impl_item_fine_prune_candidate(item: &syn::ImplItem) -> Option<FinePruneCandidate> {
+    match item {
+        syn::ImplItem::Fn(method) if impl_method_can_be_pruned(method) => {
+            Some(FinePruneCandidate {
+                name: method.sig.ident.to_string(),
+                refs: collect_idents(method.to_token_stream()),
+            })
+        }
+        syn::ImplItem::Const(item) if impl_const_can_be_pruned(item) => Some(FinePruneCandidate {
+            name: item.ident.to_string(),
+            refs: collect_idents(item.to_token_stream()),
+        }),
+        _ => None,
+    }
+}
+
+fn impl_method_can_be_pruned(method: &syn::ImplItemFn) -> bool {
+    !method
+        .attrs
+        .iter()
+        .any(|attr| attr.path().is_ident("cfg") || attr.path().is_ident("cfg_attr"))
+}
+
+fn impl_const_can_be_pruned(item: &syn::ImplItemConst) -> bool {
+    !item
+        .attrs
+        .iter()
+        .any(|attr| attr.path().is_ident("cfg") || attr.path().is_ident("cfg_attr"))
+}
+
+fn item_const_can_be_pruned(item: &syn::ItemConst) -> bool {
+    !item
+        .attrs
+        .iter()
+        .any(|attr| attr.path().is_ident("cfg") || attr.path().is_ident("cfg_attr"))
+}
+
+fn prune_removed_const_uses_in_items(items: &mut Vec<Item>, removed_names: &HashSet<String>) {
+    let mut out = Vec::with_capacity(items.len());
+    for item in std::mem::take(items) {
+        match item {
+            Item::Mod(mut module) => {
+                if let Some((_, items)) = &mut module.content {
+                    prune_removed_const_uses_in_items(items, removed_names);
+                }
+                out.push(Item::Mod(module));
+            }
+            Item::Use(mut item) => {
+                if let Some(tree) = prune_removed_const_use_tree(&item.tree, removed_names) {
+                    item.tree = tree;
+                    out.push(Item::Use(item));
+                }
+            }
+            item => out.push(item),
+        }
+    }
+    *items = out;
+}
+
+fn prune_removed_const_use_tree(
+    tree: &UseTree,
+    removed_names: &HashSet<String>,
+) -> Option<UseTree> {
+    match tree {
+        UseTree::Path(path) => {
+            let mut path = path.clone();
+            path.tree = Box::new(prune_removed_const_use_tree(&path.tree, removed_names)?);
+            Some(UseTree::Path(path))
+        }
+        UseTree::Name(name) => {
+            (!removed_names.contains(&name.ident.to_string())).then(|| UseTree::Name(name.clone()))
+        }
+        UseTree::Rename(rename) => (!removed_names.contains(&rename.ident.to_string()))
+            .then(|| UseTree::Rename(rename.clone())),
+        UseTree::Glob(_) => Some(tree.clone()),
+        UseTree::Group(group) => {
+            let mut items = Punctuated::<UseTree, Token![,]>::new();
+            for item in &group.items {
+                if let Some(item) = prune_removed_const_use_tree(item, removed_names) {
+                    items.push(item);
+                }
+            }
+            if items.is_empty() {
+                None
+            } else {
+                let mut group = group.clone();
+                group.items = items;
+                Some(UseTree::Group(group))
+            }
+        }
+    }
+}
+
 fn collect_reexport_roots(
     tree: &UseTree,
     module_path: &[String],
@@ -1505,6 +1760,114 @@ mod tests {
     }
 
     #[test]
+    fn prunes_unused_inherent_impl_methods() {
+        let mut file: File = syn::parse_quote! {
+            struct A;
+
+            impl A {
+                pub fn used(&self) {
+                    self.helper();
+                }
+
+                pub fn unused(&self) {}
+
+                fn helper(&self) {}
+            }
+
+            trait T {
+                fn required(&self);
+            }
+
+            impl T for A {
+                fn required(&self) {
+                    self.trait_helper();
+                }
+            }
+
+            impl A {
+                fn trait_helper(&self) {}
+                fn unused_private(&self) {}
+            }
+
+            fn main() {
+                let a = A;
+                a.used();
+                <A as T>::required(&a);
+            }
+        };
+
+        prune_unused_fine_items(&mut file);
+        let output = prettyplease::unparse(&file);
+
+        assert!(output.contains("fn used"));
+        assert!(output.contains("fn helper"));
+        assert!(output.contains("fn required"));
+        assert!(output.contains("fn trait_helper"));
+        assert!(!output.contains("fn unused("));
+        assert!(!output.contains("fn unused_private"));
+    }
+
+    #[test]
+    fn prunes_consts_only_used_by_pruned_items() {
+        let mut file: File = syn::parse_quote! {
+            const USED_TOP: usize = 1;
+            const UNUSED_TOP: usize = 2;
+
+            struct A;
+
+            impl A {
+                const USED_ASSOC: usize = USED_TOP;
+                const UNUSED_ASSOC: usize = UNUSED_TOP;
+
+                fn used(&self) -> usize {
+                    Self::USED_ASSOC
+                }
+
+                fn unused(&self) -> usize {
+                    Self::UNUSED_ASSOC + UNUSED_TOP
+                }
+            }
+
+            fn main() {
+                let _ = A.used();
+            }
+        };
+
+        prune_unused_fine_items(&mut file);
+        let output = prettyplease::unparse(&file);
+
+        assert!(output.contains("const USED_TOP"));
+        assert!(output.contains("const USED_ASSOC"));
+        assert!(output.contains("fn used"));
+        assert!(!output.contains("UNUSED_TOP"));
+        assert!(!output.contains("UNUSED_ASSOC"));
+        assert!(!output.contains("fn unused"));
+    }
+
+    #[test]
+    fn prunes_removed_const_reexports() {
+        let mut file: File = syn::parse_quote! {
+            pub mod constants {
+                pub const USED: usize = 1;
+                pub const UNUSED: usize = 2;
+            }
+
+            pub use constants::{UNUSED, USED};
+
+            fn main() {
+                let _ = USED;
+            }
+        };
+
+        prune_unused_fine_items(&mut file);
+        let output = prettyplease::unparse(&file);
+
+        assert!(output.contains("pub const USED"));
+        assert!(output.contains("pub use constants::USED"));
+        assert!(!output.contains("UNUSED"));
+    }
+
+    #[test]
     fn item_level_dce_excludes_unreachable_library_items() {
         let output = pack_project(
             repo_root(),
@@ -1514,6 +1877,7 @@ mod tests {
                 minify: false,
                 max_bytes: None,
                 warn_bytes: usize::MAX,
+                prune_impl_items: true,
             },
         )
         .expect("pack luogu_p3372");
@@ -1541,6 +1905,7 @@ mod tests {
                 minify: false,
                 max_bytes: None,
                 warn_bytes: usize::MAX,
+                prune_impl_items: true,
             },
         )
         .expect("pack formatted luogu_p5502");
@@ -1560,6 +1925,7 @@ mod tests {
                 minify: true,
                 max_bytes: None,
                 warn_bytes: usize::MAX,
+                prune_impl_items: true,
             },
         )
         .expect("pack minified luogu_p5502");
@@ -1578,6 +1944,7 @@ mod tests {
                 minify: true,
                 max_bytes: Some(10),
                 warn_bytes: usize::MAX,
+                prune_impl_items: true,
             },
         )
         .expect_err("too-small max-bytes should fail");
@@ -1595,6 +1962,7 @@ mod tests {
                 minify: false,
                 max_bytes: None,
                 warn_bytes: usize::MAX,
+                prune_impl_items: true,
             },
         )
         .expect("pack luogu_p1383");
@@ -1618,6 +1986,7 @@ mod tests {
                     minify: true,
                     max_bytes: None,
                     warn_bytes: usize::MAX,
+                    prune_impl_items: true,
                 },
             )
             .unwrap_or_else(|err| panic!("{bin} failed: {err}"));

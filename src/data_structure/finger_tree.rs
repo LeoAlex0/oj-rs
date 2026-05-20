@@ -11,8 +11,8 @@ use std::{
 
 pub mod prelude {
     pub use super::{
-        cache_line_chunk_capacity, chunk_capacity_for_bytes, Chunk, ChunkedFingerTree, FingerTree,
-        FingerTreeStore, Measured, Value, CACHE_LINE_BYTES,
+        chunk_capacity_for_bytes, Chunk, FingerTree, FingerTreeStore, Measured, Value,
+        CACHE_LINE_BYTES,
     };
 }
 
@@ -41,21 +41,22 @@ pub const CACHE_LINE_BYTES: usize = 64;
 /// `size_of::<A>()` 结果直接塞进泛型类型的数组长度里。因此底层仍然保留
 /// `Chunk<A, const N>`，调用侧可以用这个函数生成 `N`，避免手写魔法数字。
 ///
-/// 估算公式把 `Chunk` 头部的 `measure + len` 扣掉，再把剩余空间分给元素。它是保守的：
-/// 对齐带来的填充可能让真实大小略大于目标字节数；对当前 `Value<usize>`/`Size` 场景则正好
-/// 得到 64 字节 chunk。
+/// 实现上使用 `Chunk<A, 0>` 和 `Chunk<A, 1>` 的真实布局差来估算每个元素带来的
+/// 增量，而不是手写 `measure + len + items` 的字段大小。这样如果 `Chunk` 的字段布局、
+/// 对齐或尾部填充发生变化，容量估算会跟着实际类型布局一起变化。
 pub const fn chunk_capacity_for_bytes<A: Measured>(target_bytes: usize) -> usize {
-    let header = size_of::<A::Measure>() + size_of::<usize>();
-    let item = size_of::<A>();
-    let payload = target_bytes.saturating_sub(header);
+    let zero = size_of::<Chunk<A, 0>>();
+    let one = size_of::<Chunk<A, 1>>();
+    let item = one.saturating_sub(zero);
 
     if item == 0 {
-        if payload == 0 {
+        if target_bytes == 0 {
             1
         } else {
-            payload
+            target_bytes
         }
     } else {
+        let payload = target_bytes.saturating_sub(zero);
         let capacity = payload / item;
         if capacity == 0 {
             1
@@ -65,23 +66,18 @@ pub const fn chunk_capacity_for_bytes<A: Measured>(target_bytes: usize) -> usize
     }
 }
 
-/// 以一个 cache line 为目标估算 `Chunk<A, N>` 的容量。
-pub const fn cache_line_chunk_capacity<A: Measured>() -> usize {
-    chunk_capacity_for_bytes::<A>(CACHE_LINE_BYTES)
-}
-
 pub struct Chunk<A: Measured, const N: usize> {
     measure: A::Measure,
     len: usize,
     items: [MaybeUninit<A>; N],
 }
 
-pub struct ChunkedFingerTree<
+pub struct FingerTree<
     A: Measured,
-    const N: usize,
+    const N: usize = 1,
     R: FingerTreeRefs<Chunk<A, N>> = FingerTreeStore<Chunk<A, N>>,
 > {
-    chunks: FingerTree<Chunk<A, N>, R>,
+    chunks: RawFingerTree<Chunk<A, N>, R>,
 }
 
 impl<A: Measured, const N: usize> Chunk<A, N> {
@@ -109,9 +105,67 @@ impl<A: Measured, const N: usize> Chunk<A, N> {
 
     fn push_back(&mut self, value: A) {
         assert!(self.len < N, "chunk capacity exceeded");
-        self.measure = self.measure.clone().merge(value.measure());
+        append_measure(&mut self.measure, value.measure());
         self.items[self.len].write(value);
         self.len += 1;
+    }
+
+    fn push_front(&mut self, value: A) {
+        assert!(self.len < N, "chunk capacity exceeded");
+        for i in (0..self.len).rev() {
+            // SAFETY: `[0, len)` 已初始化，向右平移一格，目标槽位不会被读取。
+            unsafe {
+                let item = self.items[i].as_ptr().read();
+                self.items[i + 1].write(item);
+            }
+        }
+        prepend_measure(&mut self.measure, value.measure());
+        self.items[0].write(value);
+        self.len += 1;
+    }
+
+    fn singleton(value: A) -> Self {
+        let mut chunk = Self::empty();
+        chunk.push_back(value);
+        chunk
+    }
+
+    fn pop_front(&mut self) -> Option<A> {
+        if self.len == 0 {
+            return None;
+        }
+        // SAFETY: `len > 0`，首槽已初始化；后续槽位左移覆盖空洞。
+        let value = unsafe { self.items[0].as_ptr().read() };
+        for i in 1..self.len {
+            // SAFETY: `i < len`，源槽位已初始化；目标槽位之前已被移出或覆盖。
+            unsafe {
+                let item = self.items[i].as_ptr().read();
+                self.items[i - 1].write(item);
+            }
+        }
+        self.len -= 1;
+        self.recompute_measure();
+        Some(value)
+    }
+
+    fn pop_back(&mut self) -> Option<A> {
+        if self.len == 0 {
+            return None;
+        }
+        self.len -= 1;
+        // SAFETY: 递减后的 `len` 正是旧最后一个已初始化槽位。
+        let value = unsafe { self.items[self.len].as_ptr().read() };
+        self.recompute_measure();
+        Some(value)
+    }
+
+    fn recompute_measure(&mut self) {
+        self.measure = self
+            .as_slice()
+            .iter()
+            .map(|value| value.measure())
+            .reduce(Semigroup::merge)
+            .unwrap_or_else(A::Measure::empty);
     }
 
     fn first(&self) -> Option<A> {
@@ -130,34 +184,42 @@ impl<A: Measured, const N: usize> Chunk<A, N> {
     where
         F: Fn(&A::Measure) -> bool,
     {
-        let this = ManuallyDrop::new(self);
-        let mut before = Self::empty();
-        let mut after = Self::empty();
-        let mut middle = None;
-
-        for i in 0..this.len {
-            // SAFETY: `i < len`，该槽位已初始化；`ManuallyDrop` 防止之后重复析构。
-            let value = unsafe { this.items[i].as_ptr().read() };
-            if middle.is_some() {
-                after.push_back(value);
-                continue;
-            }
-
+        let mut split_index = None;
+        for (i, value) in self.as_slice().iter().enumerate() {
             let next = offset.clone().merge(value.measure());
             if pred(&next) {
-                middle = Some(value);
+                split_index = Some(i);
+                break;
             } else {
                 offset = next;
-                before.push_back(value);
             }
         }
 
-        let middle = middle?;
-        Some((
-            (!before.is_empty()).then_some(before),
-            middle,
-            (!after.is_empty()).then_some(after),
-        ))
+        let split_index = split_index?;
+        let this = ManuallyDrop::new(self);
+        let before = (split_index > 0).then(|| {
+            let mut chunk = Self::empty();
+            for i in 0..split_index {
+                // SAFETY: `i < split_index <= len`，对应槽位已初始化；`this`
+                // 被 `ManuallyDrop` 持有，后面不会再自动析构这些已搬走的值。
+                chunk.push_back(unsafe { this.items[i].as_ptr().read() });
+            }
+            chunk
+        });
+
+        // SAFETY: `split_index` 来自 `[0, len)` 的扫描结果，该槽位已初始化。
+        let middle = unsafe { this.items[split_index].as_ptr().read() };
+
+        let after = (split_index + 1 < this.len).then(|| {
+            let mut chunk = Self::empty();
+            for i in split_index + 1..this.len {
+                // SAFETY: 同上，右半边槽位均在原 `len` 范围内且已初始化。
+                chunk.push_back(unsafe { this.items[i].as_ptr().read() });
+            }
+            chunk
+        });
+
+        Some((before, middle, after))
     }
 }
 
@@ -190,7 +252,7 @@ impl<A: Measured, const N: usize> Measured for Chunk<A, N> {
     }
 }
 
-impl<A, const N: usize, R> Clone for ChunkedFingerTree<A, N, R>
+impl<A, const N: usize, R> Clone for FingerTree<A, N, R>
 where
     A: Measured,
     R: FingerTreeRefs<Chunk<A, N>>,
@@ -202,30 +264,24 @@ where
     }
 }
 
-impl<A, const N: usize, R> ChunkedFingerTree<A, N, R>
+impl<A, const N: usize, R> FingerTree<A, N, R>
 where
     A: Measured,
     R: FingerTreeRefs<Chunk<A, N>>,
 {
+    #[inline]
     pub fn new() -> Self {
         Self {
-            chunks: FingerTree::new(),
+            chunks: RawFingerTree::new(),
         }
     }
 
-    pub fn from_chunks(chunks: FingerTree<Chunk<A, N>, R>) -> Self {
-        Self { chunks }
-    }
-
-    pub fn chunks(&self) -> &FingerTree<Chunk<A, N>, R> {
-        &self.chunks
-    }
-
+    #[inline]
     pub fn from_iter_in<T>(refs: &mut R, iter: T) -> Self
     where
         T: IntoIterator<Item = A>,
     {
-        let mut chunks = FingerTree::new();
+        let mut chunks = RawFingerTree::new();
         let mut chunk = Chunk::empty();
         for value in iter {
             if chunk.is_full() {
@@ -240,33 +296,139 @@ where
         Self { chunks }
     }
 
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.chunks.is_empty()
     }
 
+    #[inline]
     pub fn measure(&self) -> A::Measure {
         self.chunks.measure()
     }
 
+    #[inline]
     pub fn front(&self, refs: &R) -> Option<A> {
         self.chunks.front(refs).and_then(|chunk| chunk.first())
     }
 
+    #[inline]
     pub fn back(&self, refs: &R) -> Option<A> {
         self.chunks.back(refs).and_then(|chunk| chunk.last())
     }
 
+    #[inline]
     pub fn concat(&self, refs: &mut R, other: &Self) -> Self {
         Self {
             chunks: self.chunks.concat(refs, &other.chunks),
         }
     }
 
-    pub fn into_concat(mut self, refs: &mut R, other: Self) -> Self {
+    #[inline]
+    pub fn concat_mut(&mut self, refs: &mut R, other: Self) {
         self.chunks.concat_mut(refs, other.chunks);
+    }
+
+    #[inline]
+    pub fn into_concat(mut self, refs: &mut R, other: Self) -> Self {
+        self.concat_mut(refs, other);
         self
     }
 
+    #[inline]
+    pub fn push_front(&self, refs: &mut R, value: A) -> Self {
+        self.clone().into_push_front(refs, value)
+    }
+
+    #[inline]
+    pub fn push_back(&self, refs: &mut R, value: A) -> Self {
+        self.clone().into_push_back(refs, value)
+    }
+
+    #[inline]
+    pub fn push_front_mut(&mut self, refs: &mut R, value: A) {
+        match self.chunks.pop_front(refs) {
+            Some(mut chunk) if !chunk.is_full() => {
+                chunk.push_front(value);
+                self.chunks.push_front_mut(refs, chunk);
+            }
+            Some(chunk) => {
+                self.chunks.push_front_mut(refs, chunk);
+                self.chunks.push_front_mut(refs, Chunk::singleton(value));
+            }
+            None => self.chunks.push_front_mut(refs, Chunk::singleton(value)),
+        }
+    }
+
+    #[inline]
+    pub fn push_back_mut(&mut self, refs: &mut R, value: A) {
+        match self.chunks.pop_back(refs) {
+            Some(mut chunk) if !chunk.is_full() => {
+                chunk.push_back(value);
+                self.chunks.push_back_mut(refs, chunk);
+            }
+            Some(chunk) => {
+                self.chunks.push_back_mut(refs, chunk);
+                self.chunks.push_back_mut(refs, Chunk::singleton(value));
+            }
+            None => self.chunks.push_back_mut(refs, Chunk::singleton(value)),
+        }
+    }
+
+    #[inline]
+    pub fn into_push_front(mut self, refs: &mut R, value: A) -> Self {
+        self.push_front_mut(refs, value);
+        self
+    }
+
+    #[inline]
+    pub fn into_push_back(mut self, refs: &mut R, value: A) -> Self {
+        self.push_back_mut(refs, value);
+        self
+    }
+
+    #[inline]
+    pub fn pop_front(&mut self, refs: &mut R) -> Option<A> {
+        let mut chunk = self.chunks.pop_front(refs)?;
+        let value = chunk.pop_front()?;
+        if !chunk.is_empty() {
+            self.chunks.push_front_mut(refs, chunk);
+        }
+        Some(value)
+    }
+
+    #[inline]
+    pub fn pop_back(&mut self, refs: &mut R) -> Option<A> {
+        let mut chunk = self.chunks.pop_back(refs)?;
+        let value = chunk.pop_back()?;
+        if !chunk.is_empty() {
+            self.chunks.push_back_mut(refs, chunk);
+        }
+        Some(value)
+    }
+
+    #[inline]
+    pub fn view_front(&self, refs: &mut R) -> Option<(A, Self)> {
+        let mut tree = self.clone();
+        tree.pop_front(refs).map(|value| (value, tree))
+    }
+
+    #[inline]
+    pub fn view_back(&self, refs: &mut R) -> Option<(Self, A)> {
+        let mut tree = self.clone();
+        tree.pop_back(refs).map(|value| (tree, value))
+    }
+
+    #[inline]
+    pub fn into_view_front(mut self, refs: &mut R) -> Option<(A, Self)> {
+        self.pop_front(refs).map(|value| (value, self))
+    }
+
+    #[inline]
+    pub fn into_view_back(mut self, refs: &mut R) -> Option<(Self, A)> {
+        self.pop_back(refs).map(|value| (self, value))
+    }
+
+    #[inline]
     pub fn split<F>(&self, refs: &mut R, pred: F) -> Option<(Self, A, Self)>
     where
         F: Fn(&A::Measure) -> bool,
@@ -282,15 +444,65 @@ where
         }
         Some((Self { chunks: front }, value, Self { chunks: back }))
     }
+
+    #[inline]
+    pub fn into_split<F>(self, refs: &mut R, pred: F) -> Option<(Self, A, Self)>
+    where
+        F: Fn(&A::Measure) -> bool,
+    {
+        let (mut front, chunk, mut back) = self.chunks.into_split(refs, |measure| pred(measure))?;
+        let offset = front.measure();
+        let (before, value, after) = chunk.split_offset(offset, &pred)?;
+        if let Some(before) = before {
+            front.push_back_mut(refs, before);
+        }
+        if let Some(after) = after {
+            back.push_front_mut(refs, after);
+        }
+        Some((Self { chunks: front }, value, Self { chunks: back }))
+    }
+
+    #[inline]
+    fn map_refs<S, FN, FT>(&self, node_map: &FN, tree_map: &FT) -> FingerTree<A, N, S>
+    where
+        S: FingerTreeRefs<Chunk<A, N>>,
+        FN: Fn(&NodeRef<Chunk<A, N>, R>) -> NodeRef<Chunk<A, N>, S>,
+        FT: Fn(&TreeRef<Chunk<A, N>, R>) -> TreeRef<Chunk<A, N>, S>,
+    {
+        FingerTree {
+            chunks: self.chunks.map_refs(node_map, tree_map),
+        }
+    }
 }
 
-impl<A, const N: usize, R> Default for ChunkedFingerTree<A, N, R>
+impl<A, const N: usize, R> Default for FingerTree<A, N, R>
 where
     A: Measured,
     R: FingerTreeRefs<Chunk<A, N>>,
 {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl<A, const N: usize, R> Measured for FingerTree<A, N, R>
+where
+    A: Measured,
+    R: FingerTreeRefs<Chunk<A, N>>,
+{
+    type Measure = A::Measure;
+    fn measure(&self) -> Self::Measure {
+        self.chunks.measure()
+    }
+}
+
+impl<A> FromIterator<A> for FingerTree<A>
+where
+    A: Measured,
+{
+    fn from_iter<T: IntoIterator<Item = A>>(iter: T) -> Self {
+        let mut refs = FingerTreeStore::default();
+        Self::from_iter_in(&mut refs, iter)
     }
 }
 
@@ -549,16 +761,6 @@ impl<'base, A: Measured> FingerTreeStore<A, ArenaStoreFactory<'base>> {
 
 impl<'store, 'base, 'scratch, A: Measured> LayeredArenaFingerTreeStore<'store, 'base, 'scratch, A> {
     #[inline]
-    pub fn from_base(
-        &self,
-        tree: &FingerTree<A, BaseArenaFingerTreeStore<'base, A>>,
-    ) -> FingerTree<A, Self> {
-        tree.map_refs(&|reference| LayeredRef::Base(*reference), &|reference| {
-            LayeredRef::Base(*reference)
-        })
-    }
-
-    #[inline]
     fn map_base_node(
         node: &Node<A, BaseArenaFingerTreeStore<'base, A>>,
     ) -> Node<A, LayeredArenaFingerTreeStore<'store, 'base, 'scratch, A>> {
@@ -569,6 +771,20 @@ impl<'store, 'base, 'scratch, A: Measured> LayeredArenaFingerTreeStore<'store, '
     fn map_base_tree(
         tree: &Tree<A, BaseArenaFingerTreeStore<'base, A>>,
     ) -> Tree<A, LayeredArenaFingerTreeStore<'store, 'base, 'scratch, A>> {
+        tree.map_refs(&|reference| LayeredRef::Base(*reference), &|reference| {
+            LayeredRef::Base(*reference)
+        })
+    }
+}
+
+impl<'store, 'base, 'scratch, A: Measured, const N: usize>
+    LayeredArenaFingerTreeStore<'store, 'base, 'scratch, Chunk<A, N>>
+{
+    #[inline]
+    pub fn from_base(
+        &self,
+        tree: &FingerTree<A, N, BaseArenaFingerTreeStore<'base, Chunk<A, N>>>,
+    ) -> FingerTree<A, N, Self> {
         tree.map_refs(&|reference| LayeredRef::Base(*reference), &|reference| {
             LayeredRef::Base(*reference)
         })
@@ -614,10 +830,12 @@ impl<'store, 'base, 'scratch, A: Measured>
     for FingerTreeLayerMapper<'store, 'base, 'scratch, A>
 {
     type Source = Node<A, BaseArenaFingerTreeStore<'base, A>>;
+}
 
-    fn map_ref(
-        value: &Self::Source,
-    ) -> Node<A, LayeredArenaFingerTreeStore<'store, 'base, 'scratch, A>> {
+impl<'store, 'base, 'scratch, A: Measured> From<&Node<A, BaseArenaFingerTreeStore<'base, A>>>
+    for Node<A, LayeredArenaFingerTreeStore<'store, 'base, 'scratch, A>>
+{
+    fn from(value: &Node<A, BaseArenaFingerTreeStore<'base, A>>) -> Self {
         FingerTreeStore::map_base_node(value)
     }
 }
@@ -627,10 +845,12 @@ impl<'store, 'base, 'scratch, A: Measured>
     for FingerTreeLayerMapper<'store, 'base, 'scratch, A>
 {
     type Source = Tree<A, BaseArenaFingerTreeStore<'base, A>>;
+}
 
-    fn map_ref(
-        value: &Self::Source,
-    ) -> Tree<A, LayeredArenaFingerTreeStore<'store, 'base, 'scratch, A>> {
+impl<'store, 'base, 'scratch, A: Measured> From<&Tree<A, BaseArenaFingerTreeStore<'base, A>>>
+    for Tree<A, LayeredArenaFingerTreeStore<'store, 'base, 'scratch, A>>
+{
+    fn from(value: &Tree<A, BaseArenaFingerTreeStore<'base, A>>) -> Self {
         FingerTreeStore::map_base_tree(value)
     }
 }
@@ -807,7 +1027,7 @@ type DigitSplit<A, R> = (
     Option<Digit<NodeRef<A, R>>>,
 );
 
-pub struct FingerTree<A: Measured, R: FingerTreeRefs<A> = FingerTreeStore<A>> {
+struct RawFingerTree<A: Measured, R: FingerTreeRefs<A> = FingerTreeStore<A>> {
     root: Tree<A, R>,
 }
 
@@ -863,7 +1083,7 @@ enum NodeInner<A: Measured, R: FingerTreeRefs<A>> {
     },
 }
 
-impl<A, R> Clone for FingerTree<A, R>
+impl<A, R> Clone for RawFingerTree<A, R>
 where
     A: Measured,
     R: FingerTreeRefs<A>,
@@ -987,16 +1207,19 @@ where
     refs: &'a mut R,
 }
 
-impl<A, R> FingerTree<A, R>
+impl<A, R> RawFingerTree<A, R>
 where
     A: Measured,
     R: FingerTreeRefs<A>,
 {
+    #[inline]
     pub fn new() -> Self {
         Self {
             root: Tree::empty(),
         }
     }
+
+    #[inline]
     pub fn from_iter_in<T>(refs: &mut R, iter: T) -> Self
     where
         T: IntoIterator<Item = A>,
@@ -1008,83 +1231,73 @@ where
         }
         Self { root }
     }
+
+    #[inline]
     pub fn is_empty(&self) -> bool {
         matches!(self.root.0, TreeInner::Empty)
     }
+
+    #[inline]
     pub fn measure(&self) -> A::Measure {
         self.root.measure()
     }
+
+    #[inline]
     pub fn front(&self, refs: &R) -> Option<A> {
         self.root
             .front_node()
             .map(|node| Node::leaf_value(refs, &node))
     }
+
+    #[inline]
     pub fn back(&self, refs: &R) -> Option<A> {
         self.root
             .back_node()
             .map(|node| Node::leaf_value(refs, &node))
     }
-    pub fn push_front(&self, refs: &mut R, value: A) -> Self {
-        self.clone().into_push_front(refs, value)
-    }
-    pub fn push_back(&self, refs: &mut R, value: A) -> Self {
-        self.clone().into_push_back(refs, value)
-    }
+
+    #[inline]
     pub fn push_front_mut(&mut self, refs: &mut R, value: A) {
         let node = refs.alloc_node(Node::leaf(value));
         self.root.push_front_mut(refs, node);
     }
+
+    #[inline]
     pub fn push_back_mut(&mut self, refs: &mut R, value: A) {
         let node = refs.alloc_node(Node::leaf(value));
         self.root.push_back_mut(refs, node);
     }
-    pub fn into_push_front(mut self, refs: &mut R, value: A) -> Self {
-        self.push_front_mut(refs, value);
-        self
-    }
-    pub fn into_push_back(mut self, refs: &mut R, value: A) -> Self {
-        self.push_back_mut(refs, value);
-        self
-    }
+
+    #[inline]
     pub fn concat(&self, refs: &mut R, other: &Self) -> Self {
         Self {
             root: Tree::concat_ref(refs, &self.root, &other.root),
         }
     }
+
+    #[inline]
     pub fn concat_mut(&mut self, refs: &mut R, other: Self) {
         let left = self.take_root();
         self.root = Tree::concat(refs, left, other.root);
     }
-    pub fn into_concat(mut self, refs: &mut R, other: Self) -> Self {
-        self.concat_mut(refs, other);
-        self
-    }
-    pub fn view_front(&self, refs: &mut R) -> Option<(A, Self)> {
-        let (head, root) = Tree::view_front_with(refs, self.root.0.clone())?;
-        Some((Node::leaf_value(refs, &head), Self { root }))
-    }
-    pub fn view_back(&self, refs: &mut R) -> Option<(Self, A)> {
-        let (root, last) = Tree::view_back_with(refs, self.root.0.clone())?;
-        Some((Self { root }, Node::leaf_value(refs, &last)))
-    }
+
+    #[inline]
     pub fn pop_front(&mut self, refs: &mut R) -> Option<A> {
         let old = self.take_root();
         let (head, rest) = Tree::view_front_with(refs, old.0)?;
         self.root = rest;
         Some(Node::leaf_value(refs, &head))
     }
+
+    #[inline]
     pub fn pop_back(&mut self, refs: &mut R) -> Option<A> {
         let old = self.take_root();
         let (rest, last) = Tree::view_back_with(refs, old.0)?;
         self.root = rest;
         Some(Node::leaf_value(refs, &last))
     }
-    pub fn into_view_front(mut self, refs: &mut R) -> Option<(A, Self)> {
-        self.pop_front(refs).map(|value| (value, self))
-    }
-    pub fn into_view_back(mut self, refs: &mut R) -> Option<(Self, A)> {
-        self.pop_back(refs).map(|value| (self, value))
-    }
+
+    #[inline]
     pub fn split<F>(&self, refs: &mut R, pred: F) -> Option<(Self, A, Self)>
     where
         F: Fn(&A::Measure) -> bool,
@@ -1094,6 +1307,8 @@ where
         let mid = Node::leaf_value(refs, &mid);
         Some((Self { root: front }, mid, Self { root: back }))
     }
+
+    #[inline]
     pub fn into_split<F>(self, refs: &mut R, pred: F) -> Option<(Self, A, Self)>
     where
         F: Fn(&A::Measure) -> bool,
@@ -1104,23 +1319,25 @@ where
         Some((Self { root: front }, mid, Self { root: back }))
     }
 
+    #[inline]
     fn take_root(&mut self) -> Tree<A, R> {
         std::mem::replace(&mut self.root, Tree::empty())
     }
 
-    fn map_refs<S, FN, FT>(&self, node_map: &FN, tree_map: &FT) -> FingerTree<A, S>
+    #[inline]
+    fn map_refs<S, FN, FT>(&self, node_map: &FN, tree_map: &FT) -> RawFingerTree<A, S>
     where
         S: FingerTreeRefs<A>,
         FN: Fn(&NodeRef<A, R>) -> NodeRef<A, S>,
         FT: Fn(&TreeRef<A, R>) -> TreeRef<A, S>,
     {
-        FingerTree {
+        RawFingerTree {
             root: self.root.map_refs(node_map, tree_map),
         }
     }
 }
 
-impl<A, R> Default for FingerTree<A, R>
+impl<A, R> Default for RawFingerTree<A, R>
 where
     A: Measured,
     R: FingerTreeRefs<A>,
@@ -1130,7 +1347,7 @@ where
     }
 }
 
-impl<A, R> Measured for FingerTree<A, R>
+impl<A, R> Measured for RawFingerTree<A, R>
 where
     A: Measured,
     R: FingerTreeRefs<A>,
@@ -1141,7 +1358,7 @@ where
     }
 }
 
-impl<A> FromIterator<A> for FingerTree<A>
+impl<A> FromIterator<A> for RawFingerTree<A>
 where
     A: Measured,
 {
@@ -1511,9 +1728,19 @@ where
                     suffix: right_suffix,
                 },
             ) => {
-                let measure = left_measure.merge(mid.measure.clone()).merge(right_measure);
+                let NodeList {
+                    items: mid_items,
+                    len: mid_len,
+                    measure: mid_measure,
+                } = mid;
+                let measure = left_measure.merge(mid_measure).merge(right_measure);
                 let left_deeper = Tree::clone_inner_from_ref(refs, &left_deeper);
                 let right_deeper = Tree::clone_inner_from_ref(refs, &right_deeper);
+                let mid: NodeListIter<A, R> = NodeListIter {
+                    items: mid_items,
+                    front: 0,
+                    back: mid_len,
+                };
                 let mid =
                     Node::lift_list(refs, left_suffix.into_iter().chain(mid).chain(right_prefix));
                 let deeper = Self::concat_with_middle(refs, left_deeper, mid, right_deeper);
@@ -1780,7 +2007,7 @@ where
         // `nodes` 分组规则，结果至多 4 个；这里留 8 个槽是为了让这个动态编码
         // 在未来微调分组时仍有余量。
         debug_assert!(self.len < self.items.len());
-        self.measure = self.measure.clone().merge(measure);
+        append_measure(&mut self.measure, measure);
         self.items[self.len] = Some(node);
         self.len += 1;
     }
@@ -1910,6 +2137,16 @@ where
     R: FingerTreeRefs<A>,
 {
     refs.measure_node_ref(node)
+}
+
+fn append_measure<M: Monoid>(measure: &mut M, other: M) {
+    let old = std::mem::replace(measure, M::empty());
+    *measure = old.merge(other);
+}
+
+fn prepend_measure<M: Monoid>(measure: &mut M, other: M) {
+    let old = std::mem::replace(measure, M::empty());
+    *measure = other.merge(old);
 }
 
 fn tree_measure<A, R>(refs: &R, tree: &TreeRef<A, R>) -> A::Measure

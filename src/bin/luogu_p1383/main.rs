@@ -3,11 +3,14 @@ use solution::data_structure::ref_store::ArenaStoreFactory;
 use solution::io::{Output, Scanner};
 use solution::traits::prelude::*;
 
-type TextStore<'text> = FingerTreeStore<Value<u8>, ArenaStoreFactory<'text>>;
-type Text<'text> = FingerTree<Value<u8>, TextStore<'text>>;
+const TEXT_CHUNK: usize = chunk_capacity_for_bytes::<Value<u8>>(CACHE_LINE_BYTES);
+
+type TextStore<'text> = FingerTreeStore<Chunk<Value<u8>, TEXT_CHUNK>, ArenaStoreFactory<'text>>;
+type Text<'text> = FingerTree<Value<u8>, TEXT_CHUNK, TextStore<'text>>;
 type Rope<'text> = Value<Text<'text>>;
-type HistoryStore<'history, 'text> = FingerTreeStore<Rope<'text>, ArenaStoreFactory<'history>>;
-type History<'history, 'text> = FingerTree<Rope<'text>, HistoryStore<'history, 'text>>;
+type HistoryStore<'history, 'text> =
+    FingerTreeStore<Chunk<Rope<'text>, 1>, ArenaStoreFactory<'history>>;
+type History<'history, 'text> = FingerTree<Rope<'text>, 1, HistoryStore<'history, 'text>>;
 
 fn main() {
     let mut input = Scanner::stdin();

@@ -37,6 +37,7 @@ fn pack_binary(pack: PackArgs) -> Result<(), Box<dyn std::error::Error>> {
             minify: pack.flags.minify,
             max_bytes: pack.flags.max_bytes,
             warn_bytes: 65_536,
+            prune_impl_items: !pack.flags.no_prune_impl_items,
         },
     )?;
 
@@ -70,7 +71,7 @@ struct Cli {
     #[arg(value_name = "BIN", required_unless_present = "list")]
     bin: Option<String>,
 
-    #[arg(long, conflicts_with_all = ["bin", "no_check", "minify", "max_bytes"])]
+    #[arg(long, conflicts_with_all = ["bin", "no_check", "minify", "max_bytes", "no_prune_impl_items"])]
     list: bool,
 
     #[command(flatten)]
@@ -113,6 +114,9 @@ struct PackFlags {
         help = "Fail if generated source exceeds N bytes"
     )]
     max_bytes: Option<usize>,
+
+    #[arg(long, help = "Disable fine-grained method and constant pruning")]
+    no_prune_impl_items: bool,
 }
 
 #[derive(Debug)]
@@ -165,6 +169,7 @@ mod tests {
         assert!(pack.flags.no_check);
         assert!(pack.flags.minify);
         assert_eq!(pack.flags.max_bytes, Some(65_536));
+        assert!(!pack.flags.no_prune_impl_items);
     }
 
     #[test]
@@ -176,6 +181,16 @@ mod tests {
 
         assert_eq!(pack.bin, "luogu_p3372");
         assert!(pack.flags.minify);
+    }
+
+    #[test]
+    fn parses_no_prune_impl_items() {
+        let cli = parse(&["pack", "--no-prune-impl-items", "luogu_p3372"]);
+        let Action::Pack(pack) = cli.into_action() else {
+            panic!("expected pack action");
+        };
+
+        assert!(pack.flags.no_prune_impl_items);
     }
 
     #[test]

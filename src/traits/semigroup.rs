@@ -3,6 +3,30 @@ use std::ops::{Add, Mul};
 /// `a.merge(&b.merge(&c)) == a.merge(&b).merge(&c)`
 pub trait Semigroup {
     fn merge(self, other: Self) -> Self;
+
+    /// 右侧合并：`self = old_self.merge(other)`。
+    ///
+    /// 这是给热路径用的可选优化入口。默认实现保持和 `merge` 完全一致的语义；
+    /// 大对象可以覆写它，避免为了更新左操作数而先 clone 一份旧值。
+    #[inline]
+    fn merge_assign(&mut self, other: &Self)
+    where
+        Self: Clone,
+    {
+        *self = self.clone().merge(other.clone());
+    }
+
+    /// 左侧合并：`self = other.merge(old_self)`。
+    ///
+    /// 非交换半群里方向很重要，线段树 lazy 标记合成就属于这种场景。把它单独
+    /// 命名可以避免把“新标记在左还是在右”藏进调用点的 clone/move 细节里。
+    #[inline]
+    fn prepend_assign(&mut self, other: &Self)
+    where
+        Self: Clone,
+    {
+        *self = other.clone().merge(self.clone());
+    }
 }
 
 impl<A: Semigroup, B: Semigroup> Semigroup for (A, B) {
@@ -18,6 +42,21 @@ pub struct Identity<V>(pub V);
 impl<V> Semigroup for Identity<V> {
     fn merge(self, _: Self) -> Self {
         self
+    }
+
+    #[inline]
+    fn merge_assign(&mut self, _: &Self)
+    where
+        Self: Clone,
+    {
+    }
+
+    #[inline]
+    fn prepend_assign(&mut self, other: &Self)
+    where
+        Self: Clone,
+    {
+        *self = other.clone();
     }
 }
 

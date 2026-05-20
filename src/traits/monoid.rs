@@ -35,6 +35,30 @@ impl<T: Semigroup> Semigroup for Option<T> {
             (Some(a), Some(b)) => Some(T::merge(a, b)),
         }
     }
+
+    #[inline]
+    fn merge_assign(&mut self, other: &Self)
+    where
+        Self: Clone,
+    {
+        *self = match (self.take(), other.clone()) {
+            (None, a) => a,
+            (a, None) => a,
+            (Some(a), Some(b)) => Some(T::merge(a, b)),
+        };
+    }
+
+    #[inline]
+    fn prepend_assign(&mut self, other: &Self)
+    where
+        Self: Clone,
+    {
+        *self = match (other.clone(), self.take()) {
+            (None, a) => a,
+            (a, None) => a,
+            (Some(a), Some(b)) => Some(T::merge(a, b)),
+        };
+    }
 }
 impl<T: Semigroup> Monoid for Option<T> {
     #[inline]
@@ -54,6 +78,16 @@ impl Semigroup for Size {
     #[inline]
     fn merge(self, other: Self) -> Self {
         Size(self.0 + other.0)
+    }
+
+    #[inline]
+    fn merge_assign(&mut self, other: &Self) {
+        self.0 += other.0;
+    }
+
+    #[inline]
+    fn prepend_assign(&mut self, other: &Self) {
+        self.merge_assign(other);
     }
 }
 impl Default for Size {

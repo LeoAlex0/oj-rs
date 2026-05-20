@@ -9,6 +9,16 @@ impl Semigroup for Plus {
     fn merge(self, other: Self) -> Self {
         Plus(self.0 + other.0)
     }
+
+    #[inline]
+    fn merge_assign(&mut self, other: &Self) {
+        self.0 += other.0;
+    }
+
+    #[inline]
+    fn prepend_assign(&mut self, other: &Self) {
+        self.merge_assign(other);
+    }
 }
 impl Monoid for Plus {
     #[inline]

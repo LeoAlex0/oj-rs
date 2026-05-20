@@ -69,8 +69,8 @@ fn views_preserve_order() {
 #[test]
 fn arc_store_operations() {
     let mut refs = FingerTreeStore::new(ArcStoreFactory);
-    let mut front: FingerTree<Value<usize>, _> = FingerTree::new();
-    let mut back: FingerTree<Value<usize>, _> = FingerTree::new();
+    let mut front: FingerTree<Value<usize>, 1, _> = FingerTree::new();
+    let mut back: FingerTree<Value<usize>, 1, _> = FingerTree::new();
 
     for i in 0..16 {
         front.push_back_mut(&mut refs, Value(i));
@@ -90,7 +90,7 @@ fn arc_store_operations() {
 #[test]
 fn arena_store_shares_array_storage() {
     ArenaStoreFactory::scoped(4096, |factory| {
-        let mut arena: FingerTreeStore<Value<usize>, _> = FingerTreeStore::new(factory);
+        let mut arena: FingerTreeStore<Chunk<Value<usize>, 1>, _> = FingerTreeStore::new(factory);
         let mut front = FingerTree::new();
         let mut back = FingerTree::new();
 
@@ -113,8 +113,8 @@ fn arena_store_shares_array_storage() {
 #[test]
 fn arena_consuming_operations() {
     ArenaStoreFactory::scoped(4096, |factory| {
-        let mut arena: FingerTreeStore<Value<usize>, _> = FingerTreeStore::new(factory);
-        let mut tree: FingerTree<_, _> = FingerTree::new();
+        let mut arena: FingerTreeStore<Chunk<Value<usize>, 1>, _> = FingerTreeStore::new(factory);
+        let mut tree: FingerTree<_, 1, _> = FingerTree::new();
         for i in 0..64 {
             tree.push_back_mut(&mut arena, Value(i));
         }
@@ -136,8 +136,8 @@ fn arena_consuming_operations() {
 #[test]
 fn const_arena_store_uses_static_capacity() {
     ConstArenaStoreFactory::<4096>::scoped(|factory| {
-        let mut arena: FingerTreeStore<Value<usize>, _> = FingerTreeStore::new(factory);
-        let tree: FingerTree<_, _> = FingerTree::from_iter_in(&mut arena, (0..64).map(Value));
+        let mut arena: FingerTreeStore<Chunk<Value<usize>, 1>, _> = FingerTreeStore::new(factory);
+        let tree: FingerTree<_, 1, _> = FingerTree::from_iter_in(&mut arena, (0..64).map(Value));
 
         assert_eq!(tree.front(&arena), Some(Value(0)));
         assert_eq!(tree.back(&arena), Some(Value(63)));
@@ -149,14 +149,14 @@ fn const_arena_store_uses_static_capacity() {
 #[should_panic(expected = "const arena capacity exceeded")]
 fn const_arena_panics_on_overflow() {
     ConstArenaStoreFactory::<1>::scoped(|factory| {
-        let mut arena: FingerTreeStore<Value<usize>, _> = FingerTreeStore::new(factory);
-        let _tree: FingerTree<_, _> = FingerTree::from_iter_in(&mut arena, [Value(0), Value(1)]);
+        let mut arena: FingerTreeStore<Chunk<Value<usize>, 1>, _> = FingerTreeStore::new(factory);
+        let _tree: FingerTree<_, 1, _> = FingerTree::from_iter_in(&mut arena, [Value(0), Value(1)]);
     });
 }
 
 #[test]
 fn chunked_tree_split_and_concat() {
-    const CHUNK: usize = cache_line_chunk_capacity::<Value<usize>>();
+    const CHUNK: usize = chunk_capacity_for_bytes::<Value<usize>>(CACHE_LINE_BYTES);
 
     assert_eq!(CHUNK, 6);
     assert_eq!(
@@ -165,8 +165,8 @@ fn chunked_tree_split_and_concat() {
     );
 
     let mut refs = FingerTreeStore::default();
-    let tree: ChunkedFingerTree<Value<usize>, CHUNK> =
-        ChunkedFingerTree::from_iter_in(&mut refs, (0..64).map(Value));
+    let tree: FingerTree<Value<usize>, CHUNK> =
+        FingerTree::from_iter_in(&mut refs, (0..64).map(Value));
 
     assert_eq!(tree.measure(), Size(64));
     assert_eq!(tree.front(&refs), Some(Value(0)));
@@ -194,9 +194,9 @@ fn chunked_tree_split_and_concat() {
 #[test]
 fn layered_arena_uses_scratch_for_results() {
     ArenaStoreFactory::scoped(4096, |factory| {
-        let mut base: FingerTreeStore<Value<usize>, _> = FingerTreeStore::new(factory);
-        let front: FingerTree<_, _> = FingerTree::from_iter_in(&mut base, (0..40).map(Value));
-        let back: FingerTree<_, _> = FingerTree::from_iter_in(&mut base, (40..80).map(Value));
+        let mut base: FingerTreeStore<Chunk<Value<usize>, 1>, _> = FingerTreeStore::new(factory);
+        let front: FingerTree<_, 1, _> = FingerTree::from_iter_in(&mut base, (0..40).map(Value));
+        let back: FingerTree<_, 1, _> = FingerTree::from_iter_in(&mut base, (40..80).map(Value));
 
         base.layered(1024, |mut scratch| {
             let front = scratch.from_base(&front);

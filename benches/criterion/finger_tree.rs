@@ -6,7 +6,7 @@ use solution::{
 
 const SMALL: usize = 1_000;
 const LARGE: usize = 100_000;
-const CHUNK: usize = cache_line_chunk_capacity::<Value<usize>>();
+const CHUNK: usize = chunk_capacity_for_bytes::<Value<usize>>(CACHE_LINE_BYTES);
 
 fn arena_capacity(len: usize) -> usize {
     len * 2 + 1024
@@ -36,8 +36,9 @@ pub fn bench(c: &mut Criterion) {
 
         group.bench_with_input(BenchmarkId::new("split arena", len), &len, |b, &len| {
             ArenaStoreFactory::scoped(arena_capacity(len), |factory| {
-                let mut base: FingerTreeStore<Value<usize>, _> = FingerTreeStore::new(factory);
-                let tree: FingerTree<_, _> =
+                let mut base: FingerTreeStore<Chunk<Value<usize>, 1>, _> =
+                    FingerTreeStore::new(factory);
+                let tree: FingerTree<_, 1, _> =
                     FingerTree::from_iter_in(&mut base, (0..len).map(Value));
                 b.iter(|| {
                     base.layered(scratch_capacity(len), |mut scratch| {
@@ -55,8 +56,8 @@ pub fn bench(c: &mut Criterion) {
             &len,
             |b, &len| {
                 let mut refs = FingerTreeStore::default();
-                let tree: ChunkedFingerTree<_, CHUNK> =
-                    ChunkedFingerTree::from_iter_in(&mut refs, (0..len).map(Value));
+                let tree: FingerTree<_, CHUNK> =
+                    FingerTree::from_iter_in(&mut refs, (0..len).map(Value));
                 b.iter(|| black_box(&tree).split(&mut refs, |measure| measure > &Size(len >> 1)))
             },
         );
@@ -68,13 +69,11 @@ pub fn bench(c: &mut Criterion) {
                 ArenaStoreFactory::scoped(chunk_arena_capacity(len), |factory| {
                     let mut base: FingerTreeStore<Chunk<Value<usize>, CHUNK>, _> =
                         FingerTreeStore::new(factory);
-                    let tree: ChunkedFingerTree<_, CHUNK, _> =
-                        ChunkedFingerTree::from_iter_in(&mut base, (0..len).map(Value));
+                    let tree: FingerTree<_, CHUNK, _> =
+                        FingerTree::from_iter_in(&mut base, (0..len).map(Value));
                     b.iter(|| {
                         base.layered(scratch_capacity(chunk_count(len)), |mut scratch| {
-                            let tree = ChunkedFingerTree::from_chunks(
-                                scratch.from_base(black_box(tree.chunks())),
-                            );
+                            let tree = scratch.from_base(black_box(&tree));
                             let result = black_box(&tree)
                                 .split(&mut scratch, |measure| measure > &Size(len >> 1));
                             black_box(result.as_ref().map(|(_, value, _)| value.clone()))
@@ -107,10 +106,11 @@ pub fn bench(c: &mut Criterion) {
             BenchmarkId::new("concat arena", format!("{left_len}<>{right_len}")),
             |b| {
                 ArenaStoreFactory::scoped(arena_capacity(left_len + right_len), |factory| {
-                    let mut base: FingerTreeStore<Value<usize>, _> = FingerTreeStore::new(factory);
-                    let tree_l: FingerTree<_, _> =
+                    let mut base: FingerTreeStore<Chunk<Value<usize>, 1>, _> =
+                        FingerTreeStore::new(factory);
+                    let tree_l: FingerTree<_, 1, _> =
                         FingerTree::from_iter_in(&mut base, (0..left_len).map(Value));
-                    let tree_r: FingerTree<_, _> =
+                    let tree_r: FingerTree<_, 1, _> =
                         FingerTree::from_iter_in(&mut base, (0..right_len).map(Value));
                     b.iter(|| {
                         base.layered(scratch_capacity(left_len + right_len), |mut scratch| {
@@ -129,10 +129,10 @@ pub fn bench(c: &mut Criterion) {
             BenchmarkId::new("concat chunked Rc", format!("{left_len}<>{right_len}")),
             |b| {
                 let mut refs = FingerTreeStore::default();
-                let tree_l: ChunkedFingerTree<_, CHUNK> =
-                    ChunkedFingerTree::from_iter_in(&mut refs, (0..left_len).map(Value));
-                let tree_r: ChunkedFingerTree<_, CHUNK> =
-                    ChunkedFingerTree::from_iter_in(&mut refs, (0..right_len).map(Value));
+                let tree_l: FingerTree<_, CHUNK> =
+                    FingerTree::from_iter_in(&mut refs, (0..left_len).map(Value));
+                let tree_r: FingerTree<_, CHUNK> =
+                    FingerTree::from_iter_in(&mut refs, (0..right_len).map(Value));
                 b.iter(|| black_box(&tree_l).concat(&mut refs, black_box(&tree_r)))
             },
         );
@@ -143,20 +143,16 @@ pub fn bench(c: &mut Criterion) {
                 ArenaStoreFactory::scoped(chunk_arena_capacity(left_len + right_len), |factory| {
                     let mut base: FingerTreeStore<Chunk<Value<usize>, CHUNK>, _> =
                         FingerTreeStore::new(factory);
-                    let tree_l: ChunkedFingerTree<_, CHUNK, _> =
-                        ChunkedFingerTree::from_iter_in(&mut base, (0..left_len).map(Value));
-                    let tree_r: ChunkedFingerTree<_, CHUNK, _> =
-                        ChunkedFingerTree::from_iter_in(&mut base, (0..right_len).map(Value));
+                    let tree_l: FingerTree<_, CHUNK, _> =
+                        FingerTree::from_iter_in(&mut base, (0..left_len).map(Value));
+                    let tree_r: FingerTree<_, CHUNK, _> =
+                        FingerTree::from_iter_in(&mut base, (0..right_len).map(Value));
                     b.iter(|| {
                         base.layered(
                             scratch_capacity(chunk_count(left_len + right_len)),
                             |mut scratch| {
-                                let tree_l = ChunkedFingerTree::from_chunks(
-                                    scratch.from_base(black_box(tree_l.chunks())),
-                                );
-                                let tree_r = ChunkedFingerTree::from_chunks(
-                                    scratch.from_base(black_box(tree_r.chunks())),
-                                );
+                                let tree_l = scratch.from_base(black_box(&tree_l));
+                                let tree_r = scratch.from_base(black_box(&tree_r));
                                 let result =
                                     black_box(&tree_l).concat(&mut scratch, black_box(&tree_r));
                                 black_box(result.measure())

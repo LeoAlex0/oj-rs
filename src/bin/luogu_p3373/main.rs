@@ -19,6 +19,22 @@ impl Semigroup for Linear {
             b: (((self.k as u64 * other.b as u64) % p + self.b as u64) % p) as u32,
         }
     }
+
+    fn merge_assign(&mut self, other: &Self) {
+        let p = unsafe { P } as u64;
+        let k = ((self.k as u64 * other.k as u64) % p) as u32;
+        let b = (((self.k as u64 * other.b as u64) % p + self.b as u64) % p) as u32;
+        self.k = k;
+        self.b = b;
+    }
+
+    fn prepend_assign(&mut self, other: &Self) {
+        let p = unsafe { P } as u64;
+        let k = ((other.k as u64 * self.k as u64) % p) as u32;
+        let b = (((other.k as u64 * self.b as u64) % p + other.b as u64) % p) as u32;
+        self.k = k;
+        self.b = b;
+    }
 }
 
 impl Monoid for Linear {
@@ -42,11 +58,27 @@ impl Semigroup for Sum {
     fn merge(self, other: Self) -> Self {
         Self((self.0 + other.0) % unsafe { P })
     }
+
+    fn merge_assign(&mut self, other: &Self) {
+        self.0 = (self.0 + other.0) % unsafe { P };
+    }
+
+    fn prepend_assign(&mut self, other: &Self) {
+        self.merge_assign(other);
+    }
 }
 
 impl Semigroup for Size {
     fn merge(self, other: Self) -> Self {
         Self(self.0 + other.0)
+    }
+
+    fn merge_assign(&mut self, other: &Self) {
+        self.0 += other.0;
+    }
+
+    fn prepend_assign(&mut self, other: &Self) {
+        self.merge_assign(other);
     }
 }
 
