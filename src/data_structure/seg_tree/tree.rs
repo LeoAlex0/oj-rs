@@ -18,20 +18,12 @@ pub const DEFAULT_SEG_LEAF_BLOCK_CAPACITY: usize = 16;
 const fn capacity_for_linear_size(zero_size: usize, one_size: usize, target_bytes: usize) -> usize {
     let item_size = one_size.saturating_sub(zero_size);
 
-    if item_size == 0 {
-        if target_bytes == 0 {
-            1
-        } else {
-            target_bytes
-        }
-    } else {
-        let payload = target_bytes.saturating_sub(zero_size);
-        let capacity = payload / item_size;
-        if capacity == 0 {
-            1
-        } else {
-            capacity
-        }
+    match target_bytes
+        .saturating_sub(zero_size)
+        .checked_div(item_size)
+    {
+        Some(capacity) if capacity > 0 => capacity,
+        _ => 1,
     }
 }
 

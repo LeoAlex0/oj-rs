@@ -49,20 +49,9 @@ pub const fn chunk_capacity_for_bytes<A: Measured>(target_bytes: usize) -> usize
     let one = size_of::<Chunk<A, 1>>();
     let item = one.saturating_sub(zero);
 
-    if item == 0 {
-        if target_bytes == 0 {
-            1
-        } else {
-            target_bytes
-        }
-    } else {
-        let payload = target_bytes.saturating_sub(zero);
-        let capacity = payload / item;
-        if capacity == 0 {
-            1
-        } else {
-            capacity
-        }
+    match target_bytes.saturating_sub(zero).checked_div(item) {
+        Some(cap) if cap > 0 => cap,
+        _ => 1,
     }
 }
 
